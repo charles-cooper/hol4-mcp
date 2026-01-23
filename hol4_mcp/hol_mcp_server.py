@@ -19,8 +19,7 @@ from typing import Optional
 from fastmcp import FastMCP, Context
 
 from .hol_session import HOLSession, HOLDIR
-from .hol_cursor import ProofCursor
-from .hol_file_parser import parse_file
+from .hol_cursor import FileProofCursor
 
 
 @dataclass
@@ -29,7 +28,7 @@ class SessionEntry:
     session: HOLSession
     started: datetime
     workdir: Path
-    cursor: Optional[ProofCursor] = None
+    cursor: Optional[FileProofCursor] = None
     holmake_env: Optional[dict] = None  # env vars for holmake (auto-captured on success)
 
 
@@ -44,7 +43,7 @@ def _get_session(name: str) -> Optional[HOLSession]:
     return entry.session if entry else None
 
 
-def _get_cursor(name: str) -> Optional[ProofCursor]:
+def _get_cursor(name: str) -> Optional[FileProofCursor]:
     """Get cursor from registry, or None if not found."""
     entry = _sessions.get(name)
     return entry.cursor if entry else None
@@ -126,7 +125,7 @@ async def hol_sessions() -> str:
         # Cursor info
         if entry.cursor:
             cs = entry.cursor.status
-            cursor_str = f"{cs['current']} ({cs['position']})" if cs['current'] else "(none)"
+            cursor_str = f"{cs['active_theorem']}" if cs['active_theorem'] else "(none)"
         else:
             cursor_str = "(none)"
 
@@ -485,21 +484,24 @@ async def hol_logs(workdir: str) -> str:
 
 
 @mcp.tool()
-async def hol_cursor_init(file: str, session: str = "default", workdir: str = None, start_at: str = None) -> str:
-    """Initialize cursor and start proving a theorem.
+async def hol_file_init(
+    file: str,
+    session: str = "default",
+    workdir: str = None,
+    mode: str = "g",
+) -> str:
+    """Initialize cursor for a HOL4 script file.
 
-    Parses file, finds theorems with cheats, loads HOL context, and enters
-    goaltree mode for the specified theorem (or first cheat if not specified).
-
-    Auto-starts HOL session if needed.
+    Parses file for theorems, auto-starts HOL session if needed, loads dependencies.
+    Use hol_state_at to navigate to specific positions after init.
 
     Args:
         file: Path to .sml file containing theorems
         session: Session name (default: "default")
         workdir: Working directory for HOL (default: file's parent directory)
-        start_at: Theorem name to start at (default: first cheat)
+        mode: "g" for goalstack (default) or "gt" for goaltree with proof extraction
 
-    Returns: Status showing current position, theorems found, and current goals
+    Returns: File info with theorems and cheats list
     """
     # Validate file first
     file_path = Path(file).resolve()
@@ -515,227 +517,120 @@ async def hol_cursor_init(file: str, session: str = "default", workdir: str = No
             return start_result
         s = _get_session(session)
 
-    cursor = ProofCursor(file_path, s)
-    result = await cursor.initialize()
+    cursor = FileProofCursor(file_path, s, mode=mode)
+    result = await cursor.init()
 
     _sessions[session].cursor = cursor
 
-    # Jump to specific theorem if requested
-    if start_at:
-        thm = cursor.goto(start_at)
-        if not thm:
-            available = [t.name for t in cursor.theorems if t.has_cheat]
-            return f"ERROR: Theorem '{start_at}' not found.\nAvailable cheats: {', '.join(available)}"
-        # Load context up to target theorem
-        await cursor.load_context_to(thm.start_line)
-        result = f"Positioned at {thm.name} (line {thm.cheat_line or thm.proof_start_line})"
-
-    # Build status
-    status = cursor.status
-    lines = [
-        result,
-        "",
-        f"File: {status['file']}",
-        f"Theorems: {status['position']}",
-        f"Cheated theorems: {len(status['cheated_theorems'])}",
-    ]
-
-    if status['current']:
-        lines.append(f"Current: {status['current']} (line {status['current_line']})")
-
-        # Enter goaltree for current theorem
-        start_result = await cursor.start_current()
-        goals = await s.send("top_goals();", timeout=10)
-        lines.append("")
-        lines.append(f"=== Proving {status['current']} ===")
-        lines.append(start_result)
-        lines.append("")
-        lines.append("=== Current goals ===")
-        lines.append(goals)
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def hol_cursor_status(session: str) -> str:
-    """Get current cursor position and status.
-
-    Args:
-        session: Session name
-
-    Returns: Progress, current theorem, completed proofs (ground truth from file), remaining cheats
-    """
-    cursor = _get_cursor(session)
-    if not cursor:
-        return f"ERROR: No cursor for session '{session}'. Use hol_cursor_init() first."
-
-    # Reparse for ground truth (file may have been edited)
-    cursor.theorems = parse_file(cursor.file)
-
-    status = cursor.status
-    # Ground truth: theorems without cheats in file (not just session-completed)
-    complete_in_file = [t.name for t in cursor.theorems if not t.has_cheat]
-    total = len(cursor.theorems)
-
-    lines = [
-        f"File: {status['file']}",
-        f"Progress: {len(complete_in_file)}/{total} theorems complete",
-        f"Current: {status['current']} (line {status['current_line']})" if status['current'] else "Current: None",
-        f"Completed: {', '.join(complete_in_file) or 'None'}",
-        "",
-        f"Cheated theorems ({len(status['cheated_theorems'])}):",
-    ]
-    for c in status['cheated_theorems']:
-        marker = " <--" if c['name'] == status['current'] else ""
-        lines.append(f"  {c['name']} (line {c['line']}){marker}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def hol_cursor_goto(session: str, theorem_name: str) -> str:
-    """Jump to specific theorem by name and enter goaltree.
-
-    Use to skip ahead or go back to a different cheat.
-    Drops current proof state before jumping.
-
-    Args:
-        session: Session name
-        theorem_name: Name of theorem to jump to
-
-    Returns: Theorem info and current goals
-    """
-    cursor = _get_cursor(session)
-    if not cursor:
-        return f"ERROR: No cursor for session '{session}'. Use hol_cursor_init() first."
-
-    s = _get_session(session)
-    if not s or not s.is_running:
-        return f"ERROR: Session '{session}' is not running."
-
-    # Drop current proof state
-    await s.send("drop();", timeout=5)
-
-    # Reparse file for fresh line numbers, then jump to theorem
-    cursor.theorems = parse_file(cursor.file)
-    thm = cursor.goto(theorem_name)
-    if not thm:
-        available = [t.name for t in cursor.theorems if t.has_cheat]
-        return f"ERROR: Theorem '{theorem_name}' not found.\nAvailable cheats: {', '.join(available)}"
-
-    if not thm.has_cheat:
-        return f"WARNING: {theorem_name} has no cheat (already proved)."
-
-    # Load context up to target theorem
-    await cursor.load_context_to(thm.start_line)
-
-    # Enter goaltree
-    result = await cursor.start_current()
-    goals = await s.send("top_goals();", timeout=10)
-
-    return f"Jumped to {theorem_name} (line {thm.cheat_line or thm.proof_start_line})\n{result}\n\n=== Current goals ===\n{goals}"
-
-
-@mcp.tool()
-async def hol_cursor_reenter(session: str) -> str:
-    """Re-enter goaltree for current theorem.
-
-    Reparses the file to handle edits (e.g., after splicing a completed proof),
-    then re-enters goaltree. If the current theorem was completed (no longer
-    has cheat), advances to the next theorem with a cheat.
-
-    This tool serves two purposes:
-    1. After hol_cursor_complete + edit: loads completed theorem into HOL, advances
-    2. Retry: re-enter same theorem from scratch after exploring dead-end tactics
-
-    Args:
-        session: Session name
-
-    Returns: Confirmation and current goal state
-    """
-    cursor = _get_cursor(session)
-    if not cursor:
-        return f"ERROR: No cursor for session '{session}'. Use hol_cursor_init() first."
-
-    s = _get_session(session)
-    if not s or not s.is_running:
-        return f"ERROR: Session '{session}' is not running."
-
-    # Reparse file to get fresh line numbers (handles edits)
-    current_name = cursor.current().name if cursor.current() else None
-    cursor.theorems = parse_file(cursor.file)
-
-    # Compute cheat_line for all theorems
-    await cursor._compute_cheat_lines()
-
-    # Re-locate by name (position may have shifted), then advance if completed
-    if current_name:
-        cursor.goto(current_name)
-    current = cursor.current()
-    if not current or not current.has_cheat:
-        if not cursor.next_cheat():
-            return "All cheats complete!"
-
-    result = await cursor.start_current()
-    goals = await s.send("top_goals();", timeout=10)
-
-    return f"{result}\n\n=== Current goals ===\n{goals}"
-
-
-@mcp.tool()
-async def hol_cursor_complete(session: str) -> str:
-    """Extract completed proof, drop goal, advance to next cheat.
-
-    Call when proof is done (no goals remaining). Returns the proof script
-    for you to splice into the file yourself.
-
-    Does NOT modify the filesystem - you are responsible for editing the file
-    to replace the cheat() with the returned proof.
-
-    Args:
-        session: Session name
-
-    Returns: The proof script, theorem name, and next cheat info.
-             After splicing the proof, use hol_cursor_reenter to set up the next theorem.
-    """
-    cursor = _get_cursor(session)
-    if not cursor:
-        return f"ERROR: No cursor for session '{session}'. Use hol_cursor_init() first."
-
-    s = _get_session(session)
-    if not s or not s.is_running:
-        return f"ERROR: Session '{session}' is not running."
-
-    result = await cursor.extract_proof()
-
-    # Handle error case
-    if "error" in result:
+    if result.get("error"):
         return f"ERROR: {result['error']}"
 
-    # Get remaining cheats (excluding the one just completed)
-    remaining = [t for t in cursor.theorems if t.has_cheat and t.name != result['theorem']]
-
-    # Format successful result
+    # Build status output
     lines = [
-        f"Completed: {result['theorem']}",
-        "",
-        "=== Proof script (splice this into file) ===",
-        result['proof'],
+        f"File: {file_path}",
+        f"Theorems: {len(result['theorems'])}",
+        f"Cheats: {len(result['cheats'])}",
         "",
     ]
 
-    if remaining:
-        lines.append(f"Remaining cheated theorems ({len(remaining)}):")
-        for t in remaining:
-            lines.append(f"  {t.name} (line {t.cheat_line or t.proof_start_line})")
-        lines.extend([
-            "",
-            "Next steps:",
-            "1. Edit the file to replace the cheat() with the proof above",
-            "2. Run holmake to verify the proof compiles",
-            "3. Call hol_cursor_reenter to load completed theorem and continue",
-        ])
+    if result['theorems']:
+        lines.append("Theorems:")
+        for t in result['theorems']:
+            cheat_marker = " [CHEAT]" if t['has_cheat'] else ""
+            lines.append(f"  {t['name']} (line {t['line']}){cheat_marker}")
+
+    if result['cheats']:
+        lines.append("")
+        lines.append("Use hol_state_at to navigate to a position. Example:")
+        cheat = result['cheats'][0]
+        lines.append(f"  hol_state_at(session='{session}', line={cheat['line']})")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def hol_state_at(
+    session: str,
+    line: int,
+    col: int = 1,
+) -> str:
+    """Get proof state at file position.
+
+    Replays tactics from theorem start to position. Auto-enters theorem if needed.
+
+    Args:
+        session: Session name
+        line: 1-indexed line number
+        col: 1-indexed column number (default 1)
+
+    Returns: Goals, tactic index, error info
+    """
+    cursor = _get_cursor(session)
+    if not cursor:
+        return f"ERROR: No cursor for session '{session}'. Use hol_file_init first."
+
+    result = await cursor.state_at(line, col)
+
+    lines = []
+    if result.error:
+        lines.append(f"ERROR: {result.error}")
     else:
-        lines.append("All cheats complete! Edit the file to splice in the final proof, then run holmake to verify.")
+        lines.append(f"Tactic {result.tactic_idx}/{result.tactics_total}")
+        lines.append(f"Replayed {result.tactics_replayed} tactics")
+        lines.append("")
+        if result.goals:
+            lines.append("=== Goals ===")
+            for g in result.goals:
+                lines.append(g)
+        else:
+            lines.append("No goals (proof complete)")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def hol_file_status(session: str) -> str:
+    """Get current cursor position and file status.
+
+    Args:
+        session: Session name
+
+    Returns: File info, active theorem, theorems with cheats, completion status
+    """
+    cursor = _get_cursor(session)
+    if not cursor:
+        return f"ERROR: No cursor for session '{session}'. Use hol_file_init first."
+
+    status = cursor.status
+
+    # Count completed theorems (no cheat in file)
+    complete_in_file = [t['name'] for t in status['theorems'] if not t['has_cheat']]
+    total = len(status['theorems'])
+
+    lines = [
+        f"File: {status['file']}",
+        f"File hash: {status['file_hash'][:12]}...",
+        f"Progress: {len(complete_in_file)}/{total} theorems complete",
+        f"Loaded to line: {status['loaded_to_line']}",
+        f"Stale: {status['stale']}",
+        "",
+    ]
+
+    if status['active_theorem']:
+        lines.append(f"Active theorem: {status['active_theorem']}")
+        lines.append(f"Active tactics: {status['active_tactics']}")
+    else:
+        lines.append("Active theorem: None")
+
+    lines.append("")
+    lines.append(f"Completed: {', '.join(complete_in_file) or 'None'}")
+
+    if status['cheats']:
+        lines.append("")
+        lines.append(f"Remaining cheats ({len(status['cheats'])}):")
+        for c in status['cheats']:
+            marker = " <--" if c['theorem'] == status['active_theorem'] else ""
+            lines.append(f"  {c['theorem']} (line {c['line']}){marker}")
 
     return "\n".join(lines)
 

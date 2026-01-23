@@ -1,8 +1,145 @@
 """Parse HOL4 script files for theorem structure."""
 
+import bisect
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+@dataclass
+class TacticSpan:
+    """A tactic with its source position."""
+    text: str
+    start: tuple[int, int]  # (line, col), 1-indexed
+    end: tuple[int, int]    # (line, col), 1-indexed
+
+
+def build_line_starts(content: str) -> list[int]:
+    """Build table mapping line numbers to char offsets.
+
+    line_starts[i] = char offset where line (i+1) begins.
+    Line numbers are 1-indexed, but array is 0-indexed.
+    """
+    starts = [0]  # Line 1 starts at offset 0
+    for i, c in enumerate(content):
+        if c == '\n':
+            starts.append(i + 1)  # Next line starts after newline
+    return starts
+
+
+def offset_to_line_col(offset: int, line_starts: list[int]) -> tuple[int, int]:
+    """Convert char offset to (line, col), both 1-indexed."""
+    # Find the line: largest line_starts[i] <= offset
+    line = bisect.bisect_right(line_starts, offset)
+    col = offset - line_starts[line - 1] + 1
+    return (line, col)
+
+
+def line_col_to_offset(line: int, col: int, line_starts: list[int]) -> int:
+    """Convert (line, col) to char offset. Line and col are 1-indexed."""
+    if line < 1 or line > len(line_starts):
+        raise ValueError(f"Line {line} out of range (1-{len(line_starts)})")
+    return line_starts[line - 1] + col - 1
+
+
+def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int]]:
+    """Parse SML output from linearize_with_spans.
+
+    Expects: val it = [("text", start, end), ...]: (string * int * int) list
+    Returns: list of (text, start_offset, end_offset) tuples.
+
+    Note: HOL may output across multiple lines, so we join and search.
+    """
+    # Join all lines - HOL output may span multiple lines
+    full_output = ' '.join(output.split())
+
+    if 'val it =' not in full_output or '[' not in full_output:
+        return []
+
+    start = full_output.index('[')
+    # Find matching ] accounting for the type annotation
+    end = full_output.rindex(']') + 1
+    list_str = full_output[start:end]
+
+    if list_str == '[]':
+        return []
+
+    items = []
+    i = 1  # skip opening [
+    while i < len(list_str) - 1:
+        if list_str[i] == '(':
+            # Find matching )
+            depth = 1
+            j = i + 1
+            while depth > 0:
+                if list_str[j] == '(':
+                    depth += 1
+                elif list_str[j] == ')':
+                    depth -= 1
+                j += 1
+            tuple_str = list_str[i+1:j-1]
+
+            # Parse ("text", start, end)
+            # Find first "," after the quoted string
+            in_str = False
+            escaped = False
+            k = 0
+            while k < len(tuple_str):
+                c = tuple_str[k]
+                if escaped:
+                    escaped = False
+                elif c == '\\':
+                    escaped = True
+                elif c == '"':
+                    in_str = not in_str
+                elif not in_str and c == ',':
+                    break
+                k += 1
+
+            # Extract text (remove quotes, handle escapes)
+            text_part = tuple_str[1:k-1]  # strip quotes
+            # Unescape SML string escapes: \\ -> \, \" -> ", \n -> newline, \t -> tab
+            text_part = (text_part
+                .replace('\\\\', '\x00')  # Preserve \\ temporarily
+                .replace('\\n', '\n')     # Unescape newline
+                .replace('\\t', '\t')     # Unescape tab
+                .replace('\\"', '"')      # Unescape quote
+                .replace('\x00', '\\'))   # Restore \\
+
+            nums = tuple_str[k+1:].split(',')
+            start_off = int(nums[0].strip())
+            end_off = int(nums[1].strip())
+            items.append((text_part, start_off, end_off))
+            i = j
+        else:
+            i += 1
+    return items
+
+
+def make_tactic_spans(
+    raw_spans: list[tuple[str, int, int]],
+    proof_body_offset: int,
+    line_starts: list[int],
+) -> list[TacticSpan]:
+    """Convert raw (text, start, end) tuples to TacticSpan with line/col.
+
+    Args:
+        raw_spans: Output from parse_linearize_with_spans_output (offsets relative to proof body)
+        proof_body_offset: Char offset where proof body starts in the file
+        line_starts: Line start table for the entire file
+
+    Returns:
+        List of TacticSpan with absolute line/col positions in the file.
+    """
+    result = []
+    for text, start, end in raw_spans:
+        # Convert relative offsets to absolute
+        abs_start = proof_body_offset + start
+        abs_end = proof_body_offset + end
+        start_lc = offset_to_line_col(abs_start, line_starts)
+        end_lc = offset_to_line_col(abs_end, line_starts)
+        result.append(TacticSpan(text=text, start=start_lc, end=end_lc))
+    return result
 
 
 @dataclass
@@ -17,7 +154,11 @@ class TheoremInfo:
     has_cheat: bool
     proof_body: str = ""  # Content between Proof and QED
     attributes: list[str] = field(default_factory=list)
-    cheat_line: int | None = None  # Set by SML parser when linearize_to_cheat runs
+
+    @property
+    def line_before_qed(self) -> int:
+        """Line number of QED - 1 (last line of proof body)."""
+        return self.proof_end_line - 2
 
 
 def parse_theorems(content: str) -> list[TheoremInfo]:

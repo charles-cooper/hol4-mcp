@@ -1,134 +1,16 @@
 """Proof cursor for navigating through theorems without reloading."""
 
 import asyncio
+import hashlib
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from .hol_file_parser import TheoremInfo, parse_file, parse_p_output
+from .hol_file_parser import (
+    TheoremInfo, parse_file, parse_p_output, parse_theorems,
+    TacticSpan, build_line_starts, parse_linearize_with_spans_output,
+    make_tactic_spans, offset_to_line_col,
+)
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
-
-
-def _parse_sml_string(output: str) -> str:
-    """Extract string value from SML output like 'val it = "...": string'.
-
-    Returns the raw escaped content - DO NOT unescape, as we pass this
-    directly to another SML string literal (etq).
-    """
-    for line in output.split('\n'):
-        line = line.strip()
-        if line.startswith('val it = "'):
-            # Handle both 'val it = "...": string' and 'val it = "..." : string'
-            for suffix in ['": string', '" : string']:
-                if suffix in line:
-                    start = line.index('"') + 1
-                    end = line.rindex(suffix)
-                    return line[start:end]  # Keep SML escaping intact
-    return ""
-
-
-def _parse_sml_string_list(output: str) -> list[str]:
-    """Extract string list from SML output like 'val it = ["a", "b"]: string list'.
-
-    Returns list of raw escaped strings for passing to etq.
-    """
-    for line in output.split('\n'):
-        if 'val it = [' in line:
-            start = line.index('[')
-            end = line.rindex(']') + 1
-            list_str = line[start:end]
-            if list_str == '[]':
-                return []
-            # Parse SML string list: ["a", "b", ...]
-            items = []
-            in_string = False
-            escaped = False
-            current = ""
-            for c in list_str[1:-1]:  # skip [ and ]
-                if escaped:
-                    current += c
-                    escaped = False
-                elif c == '\\':
-                    current += c
-                    escaped = True
-                elif c == '"':
-                    if in_string:
-                        items.append(current)
-                        current = ""
-                    in_string = not in_string
-                elif in_string:
-                    current += c
-            return items
-    return []
-
-
-def _parse_linearize_result(output: str) -> tuple[list[str], int | None]:
-    """Extract (tactics, cheat_offset) from linearize_to_cheat output.
-
-    Format: val it = (["tac1", "tac2"], SOME 42): string list * int option
-    Or:     val it = ([], NONE): string list * int option
-    """
-    for line in output.split('\n'):
-        if 'val it = (' not in line:
-            continue
-        try:
-            list_start = line.index('[')
-
-            # Find matching ] by tracking bracket depth and string state
-            depth = 0
-            in_string = False
-            escaped = False
-            list_end = list_start
-            for i, c in enumerate(line[list_start:], list_start):
-                if escaped:
-                    escaped = False
-                elif c == '\\' and in_string:
-                    escaped = True
-                elif c == '"':
-                    in_string = not in_string
-                elif not in_string:
-                    if c == '[':
-                        depth += 1
-                    elif c == ']':
-                        depth -= 1
-                        if depth == 0:
-                            list_end = i + 1
-                            break
-
-            list_str = line[list_start:list_end]
-
-            # Parse string list
-            tactics = []
-            if list_str != '[]':
-                in_string = False
-                escaped = False
-                current = ""
-                for c in list_str[1:-1]:
-                    if escaped:
-                        current += c
-                        escaped = False
-                    elif c == '\\':
-                        current += c
-                        escaped = True
-                    elif c == '"':
-                        if in_string:
-                            tactics.append(current)
-                            current = ""
-                        in_string = not in_string
-                    elif in_string:
-                        current += c
-
-            # Parse offset: look for SOME N or NONE after the list
-            rest = line[list_end:]
-            offset = None
-            if 'SOME' in rest:
-                import re
-                m = re.search(r'SOME\s+(\d+)', rest)
-                if m:
-                    offset = int(m.group(1))
-
-            return tactics, offset
-        except (ValueError, IndexError):
-            continue
-    return [], None
 
 
 def _is_hol_error(output: str) -> bool:
@@ -184,263 +66,593 @@ async def get_script_dependencies(script_path: Path) -> list[str]:
     return [line.strip() for line in stdout.decode().splitlines() if line.strip()]
 
 
-def get_executable_content(content: str, up_to_line: int) -> str:
-    """Extract SML content from script up to specified line.
+# =============================================================================
+# FileProofCursor - File-centric proof state inspection
+# =============================================================================
 
-    Returns content from line 1 to up_to_line-1, including any
-    Theory/Ancestors/Libs header (which sets up the environment).
+@dataclass
+class StateAtResult:
+    """Result of state_at() call."""
+    goals: list[str]          # Current goals (may be empty if proof complete)
+    tactic_idx: int           # Index of tactic at position (0-based)
+    tactics_replayed: int     # Number of tactics replayed to reach this state
+    tactics_total: int        # Total tactics in proof
+    file_hash: str            # Content hash when this state was computed
+    error: str | None = None  # Error message if replay failed
+
+
+@dataclass
+class TheoremCheckpoint:
+    """Checkpoint state for a theorem."""
+    theorem_name: str
+    tactics_count: int            # Number of tactics when checkpoint saved
+    end_of_proof_path: Path | None = None   # Checkpoint after all tactics (for state_at)
+
+
+class FileProofCursor:
+    """File-centric proof cursor - agent edits file, cursor inspects state.
+
+    Key design principles:
+    - Content hash for change detection (poll-on-demand, no watchdog)
+    - Single active theorem at a time
+    - Agent edits file directly; cursor is read-only inspector
+    - Replay from theorem start for correctness
     """
-    lines = content.split('\n')
-    prefix_lines = lines[:up_to_line - 1]
-    return '\n'.join(prefix_lines)
 
+    def __init__(self, source_file: Path, session: HOLSession, *,
+                 checkpoint_dir: Path | None = None, mode: str = "g"):
+        """Initialize file proof cursor.
 
-class ProofCursor:
-    """Track position in file, advance through theorems without reloading."""
-
-    def __init__(self, source_file: Path, session: HOLSession):
+        Args:
+            source_file: Path to the SML script
+            session: HOL session to use
+            checkpoint_dir: Where to store checkpoints (default: .hol/cursor_checkpoints/)
+            mode: "g" for goalstack (default) or "gt" for goaltree
+                  - goalstack: uses g/e(tactic)/b, no proof extraction
+                  - goaltree: uses gt/etq "tactic"/backup, p() extracts proof script
+        """
         self.file = source_file
         self.session = session
-        self.theorems: list[TheoremInfo] = []
-        self.position: int = 0
-        self._loaded_to_line: int = 0  # Track how much content is loaded
 
-    @property
-    def completed(self) -> set[str]:
-        """Theorems without cheats (derived from current file state)."""
-        return {t.name for t in self.theorems if not t.has_cheat}
+        # Mode: "g" (goalstack) or "gt" (goaltree)
+        if mode not in ("g", "gt"):
+            raise ValueError(f"mode must be 'g' or 'gt', got '{mode}'")
+        self._mode = mode
 
-    def current(self) -> TheoremInfo | None:
-        """Get current theorem."""
-        if 0 <= self.position < len(self.theorems):
-            return self.theorems[self.position]
-        return None
+        # Checkpoint directory: .hol/cursor_checkpoints/ (alongside holmake artifacts)
+        if checkpoint_dir is None:
+            self._checkpoint_dir = source_file.parent / ".hol" / "cursor_checkpoints"
+        else:
+            self._checkpoint_dir = checkpoint_dir
 
-    def next(self) -> TheoremInfo | None:
-        """Advance to next theorem."""
-        if self.position + 1 < len(self.theorems):
-            self.position += 1
-            return self.current()
-        return None
+        # Cached file state
+        self._content: str = ""
+        self._content_hash: str = ""
+        self._line_starts: list[int] = []
+        self._theorems: list[TheoremInfo] = []
 
-    def next_cheat(self) -> TheoremInfo | None:
-        """Find first theorem with cheat."""
-        for i, thm in enumerate(self.theorems):
-            if thm.has_cheat:
-                self.position = i
+        # Active theorem state
+        self._active_theorem: str | None = None
+        self._active_tactics: list[TacticSpan] = []
+        self._current_tactic_idx: int = 0  # Current position in proof (for backup optimization)
+        self._proof_initialized: bool = False  # Whether g/gt has been called for current theorem
+
+        # What's been loaded into HOL
+        self._loaded_to_line: int = 0
+        self._loaded_content_hash: str = ""  # Hash of content up to _loaded_to_line
+
+        # Completed theorems this session
+        self._completed: set[str] = set()
+
+        # Checkpoint cache: theorem_name -> TheoremCheckpoint
+        self._checkpoints: dict[str, TheoremCheckpoint] = {}
+
+    def _compute_hash(self, content: str) -> str:
+        """Compute SHA256 hash of content."""
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def _reparse_if_changed(self) -> bool:
+        """Re-read and parse file if content changed. Returns True if changed."""
+        content = self.file.read_text()
+        content_hash = self._compute_hash(content)
+
+        if content_hash == self._content_hash:
+            return False
+
+        self._content = content
+        self._content_hash = content_hash
+        self._line_starts = build_line_starts(content)
+        self._theorems = parse_theorems(content)
+
+        # Clear active theorem if it was renamed/deleted
+        if self._active_theorem:
+            if not any(t.name == self._active_theorem for t in self._theorems):
+                self._active_theorem = None
+                self._active_tactics = []
+
+        return True
+
+    def _get_theorem(self, name: str) -> TheoremInfo | None:
+        """Get theorem by name from cached parse."""
+        for thm in self._theorems:
+            if thm.name == name:
                 return thm
         return None
 
-    def goto(self, theorem_name: str) -> TheoremInfo | None:
-        """Go to specific theorem by name."""
-        for i, thm in enumerate(self.theorems):
-            if thm.name == theorem_name:
-                self.position = i
+    def _get_theorem_at_position(self, line: int) -> TheoremInfo | None:
+        """Get theorem containing the given line number."""
+        for thm in self._theorems:
+            # Theorem spans from Theorem keyword to QED
+            # proof_start_line is line of Proof keyword
+            # proof_end_line is line of last proof content (before QED)
+            # We consider valid range as: start_line to proof_end_line (inclusive)
+            if thm.start_line <= line <= thm.proof_end_line:
                 return thm
         return None
 
-    async def initialize(self) -> str:
-        """Parse file, load HOL to first cheat, position cursor."""
-        self.theorems = parse_file(self.file)
+    def _check_stale_state(self) -> bool:
+        """Check if loaded content has changed (stale HOL state)."""
+        if self._loaded_to_line == 0:
+            return False
+        # Compare hash of content up to loaded line
+        loaded_content = '\n'.join(self._content.split('\n')[:self._loaded_to_line - 1])
+        return self._compute_hash(loaded_content) != self._loaded_content_hash
 
-        if not self.theorems:
-            return "No theorems found in file"
+    # =========================================================================
+    # Checkpoint Management
+    # =========================================================================
+
+    def _get_checkpoint_path(self, theorem_name: str, checkpoint_type: str) -> Path:
+        """Get path for a checkpoint file."""
+        # Sanitize theorem name for filename
+        safe_name = theorem_name.replace("/", "_").replace("\\", "_")
+        return self._checkpoint_dir / f"{safe_name}_{checkpoint_type}.save"
+
+    def _is_checkpoint_valid(self, theorem_name: str) -> bool:
+        """Check if cached checkpoint exists and file is present."""
+        ckpt = self._checkpoints.get(theorem_name)
+        if not ckpt:
+            return False
+        if not ckpt.end_of_proof_path or not ckpt.end_of_proof_path.exists():
+            return False
+        return True
+
+    async def _save_end_of_proof_checkpoint(self, theorem_name: str, tactics_count: int) -> bool:
+        """Save checkpoint after all tactics have been replayed.
+
+        Call this when goaltree has all tactics applied. The checkpoint
+        captures this state for fast state_at via loadState + backup_n.
+
+        Returns True if checkpoint was saved successfully.
+        """
+        self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = self._get_checkpoint_path(theorem_name, "end_of_proof")
+
+        # Save child checkpoint (incremental, ~35-45ms, 1-7MB)
+        result = await self.session.send(
+            f'PolyML.SaveState.saveChild ("{ckpt_path}", 1);', timeout=30
+        )
+        if _is_hol_error(result):
+            return False
+
+        self._checkpoints[theorem_name] = TheoremCheckpoint(
+            theorem_name=theorem_name,
+            tactics_count=tactics_count,
+            end_of_proof_path=ckpt_path,
+        )
+        return True
+
+    async def _load_checkpoint_and_backup(self, theorem_name: str, target_tactic_idx: int) -> bool:
+        """Load checkpoint and backup to target position.
+
+        Args:
+            theorem_name: Theorem whose checkpoint to load
+            target_tactic_idx: Target tactic index (0 = initial state, N = after N tactics)
+
+        Returns True if successful, False if checkpoint invalid or load failed.
+        """
+        ckpt = self._checkpoints.get(theorem_name)
+        if not ckpt or not self._is_checkpoint_valid(theorem_name):
+            return False
+
+        # Load checkpoint (~70-120ms depending on loaded theories)
+        result = await self.session.send(
+            f'PolyML.SaveState.loadState "{ckpt.end_of_proof_path}";', timeout=30
+        )
+        if _is_hol_error(result):
+            return False
+
+        # Backup to target position (~11ms for any N)
+        backups_needed = ckpt.tactics_count - target_tactic_idx
+        if backups_needed > 0:
+            result = await self.session.send(f'backup_n {backups_needed};', timeout=30)
+            if _is_hol_error(result):
+                return False
+
+        self._current_tactic_idx = target_tactic_idx
+        self._proof_initialized = True
+        return True
+
+    def _invalidate_checkpoint(self, theorem_name: str) -> None:
+        """Invalidate and delete checkpoint for a theorem."""
+        ckpt = self._checkpoints.pop(theorem_name, None)
+        if ckpt and ckpt.end_of_proof_path and ckpt.end_of_proof_path.exists():
+            ckpt.end_of_proof_path.unlink()
+
+    def _invalidate_all_checkpoints(self) -> None:
+        """Invalidate all checkpoints (e.g., when file changes significantly)."""
+        for name in list(self._checkpoints.keys()):
+            self._invalidate_checkpoint(name)
+
+    async def init(self, *, skip_holmake: bool = False) -> dict:
+        """Initialize cursor - parse file, optionally load deps.
+
+        Args:
+            skip_holmake: If True, skip holmake (deps must already be loaded)
+
+        Returns:
+            dict with:
+              - theorems: list of {name, line, has_cheat}
+              - cheats: list of theorem names with cheats
+              - error: error message if init failed
+        """
+        self._reparse_if_changed()
+
+        if not self._theorems:
+            return {"error": "No theorems found in file", "theorems": [], "cheats": []}
 
         if not self.session.is_running:
             await self.session.start()
 
-        # Find first cheat
-        first_cheat_idx = next(
-            (i for i, t in enumerate(self.theorems) if t.has_cheat),
-            None
+        # Load dependencies if not skipping holmake
+        if not skip_holmake:
+            try:
+                deps = await get_script_dependencies(self.file)
+                for dep in deps:
+                    await self.session.send(f'load "{dep}";', timeout=60)
+            except FileNotFoundError:
+                pass  # holdeptool not available, skip dep loading
+
+        thm_list = [
+            {"name": t.name, "line": t.start_line, "has_cheat": t.has_cheat}
+            for t in self._theorems
+        ]
+        # Return cheat info with line/col for direct use with state_at
+        cheats = [
+            {
+                "theorem": t.name,
+                "line": t.proof_start_line,  # Line of first proof content
+                "col": 1,
+            }
+            for t in self._theorems if t.has_cheat
+        ]
+
+        return {"theorems": thm_list, "cheats": cheats}
+
+    async def enter_theorem(self, name: str) -> dict:
+        """Enter a theorem for proof state inspection.
+
+        Loads context up to theorem start, parses tactics, sets up for state_at.
+
+        Args:
+            name: Theorem name to enter
+
+        Returns:
+            dict with:
+              - theorem: theorem name
+              - goal: theorem goal
+              - tactics: number of tactics in proof
+              - has_cheat: whether proof has cheat
+              - error: error message if failed
+        """
+        self._reparse_if_changed()
+
+        thm = self._get_theorem(name)
+        if not thm:
+            return {"error": f"Theorem '{name}' not found"}
+
+        # Load context up to theorem start (if not already loaded)
+        if thm.start_line > self._loaded_to_line:
+            content_lines = self._content.split('\n')
+            # _loaded_to_line=0 means nothing loaded, so start from line 0 (index 0)
+            # _loaded_to_line=N means lines 1..N-1 loaded, so start from index N-1
+            start_idx = max(0, self._loaded_to_line - 1) if self._loaded_to_line > 0 else 0
+            to_load = '\n'.join(content_lines[start_idx:thm.start_line - 1])
+            if to_load.strip():
+                result = await self.session.send(to_load, timeout=300)
+                if _is_hol_error(result):
+                    return {"error": f"Failed to load context: {result[:300]}"}
+
+            # Update loaded tracking
+            loaded_content = '\n'.join(content_lines[:thm.start_line - 1])
+            self._loaded_to_line = thm.start_line
+            self._loaded_content_hash = self._compute_hash(loaded_content)
+
+        # Parse tactics from proof body
+        if thm.proof_body:
+            escaped_body = escape_sml_string(thm.proof_body)
+            lin_result = await self.session.send(
+                f'linearize_with_spans "{escaped_body}";', timeout=30
+            )
+            raw_spans = parse_linearize_with_spans_output(lin_result)
+
+            # Calculate proof body offset in file
+            # Find where proof body starts (after "Proof\n")
+            proof_start_offset = self._content.find(
+                thm.proof_body,
+                self._line_starts[thm.proof_start_line - 1] if thm.proof_start_line <= len(self._line_starts) else 0
+            )
+            if proof_start_offset == -1:
+                proof_start_offset = 0  # Fallback
+
+            self._active_tactics = make_tactic_spans(raw_spans, proof_start_offset, self._line_starts)
+        else:
+            self._active_tactics = []
+
+        self._active_theorem = name
+        self._current_tactic_idx = 0  # Reset position for new theorem
+        self._proof_initialized = False  # Will be set on first state_at
+
+        return {
+            "theorem": name,
+            "goal": thm.goal,
+            "tactics": len(self._active_tactics),
+            "has_cheat": thm.has_cheat,
+        }
+
+    async def state_at(self, line: int, col: int = 1) -> StateAtResult:
+        """Get proof state at file position.
+
+        Uses checkpoint + backup_n for fast navigation (~80-130ms constant time)
+        when checkpoint is available. Falls back to incremental replay otherwise.
+
+        Auto-enters the theorem containing the position if not already active.
+
+        Args:
+            line: 1-indexed line number
+            col: 1-indexed column number (default 1)
+
+        Returns:
+            StateAtResult with goals, tactic index, etc.
+        """
+        # Reparse if file changed
+        changed = self._reparse_if_changed()
+
+        # Find theorem at position and auto-enter if needed
+        thm_at_pos = self._get_theorem_at_position(line)
+        if not thm_at_pos:
+            return StateAtResult(
+                goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
+                file_hash=self._content_hash,
+                error=f"Position ({line}, {col}) is not within any theorem"
+            )
+
+        # Auto-enter theorem if different from active
+        if self._active_theorem != thm_at_pos.name:
+            enter_result = await self.enter_theorem(thm_at_pos.name)
+            if "error" in enter_result:
+                return StateAtResult(
+                    goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
+                    file_hash=self._content_hash, error=enter_result["error"]
+                )
+            changed = True  # Force re-check since we just entered
+
+        thm = self._get_theorem(self._active_theorem)
+        if not thm:
+            return StateAtResult(
+                goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
+                file_hash=self._content_hash, error=f"Theorem '{self._active_theorem}' no longer exists"
+            )
+
+        # If file changed, invalidate checkpoint and re-parse tactics
+        if changed:
+            self._invalidate_checkpoint(self._active_theorem)
+            if thm.proof_body:
+                escaped_body = escape_sml_string(thm.proof_body)
+                lin_result = await self.session.send(
+                    f'linearize_with_spans "{escaped_body}";', timeout=30
+                )
+                raw_spans = parse_linearize_with_spans_output(lin_result)
+                proof_start_offset = self._content.find(
+                    thm.proof_body,
+                    self._line_starts[thm.proof_start_line - 1] if thm.proof_start_line <= len(self._line_starts) else 0
+                )
+                if proof_start_offset == -1:
+                    proof_start_offset = 0
+                self._active_tactics = make_tactic_spans(raw_spans, proof_start_offset, self._line_starts)
+
+        # Check if position is within theorem bounds
+        proof_keyword_line = thm.proof_start_line - 1
+        qed_line = thm.proof_end_line - 1
+        if line < proof_keyword_line or line >= thm.proof_end_line:
+            return StateAtResult(
+                goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
+                file_hash=self._content_hash,
+                error=f"Position ({line}, {col}) not in theorem '{self._active_theorem}' "
+                      f"(valid lines {proof_keyword_line}-{qed_line})"
+            )
+
+        # Find tactic index at position (state BEFORE tactic at position)
+        tactic_idx = 0
+        for i, tac in enumerate(self._active_tactics):
+            if (line, col) < tac.start:
+                break
+            tactic_idx = i + 1
+
+        tactics_to_replay = min(tactic_idx, len(self._active_tactics))
+        error_msg = None
+        actual_replayed = 0
+        used_checkpoint = False
+
+        # Strategy 0: Already at target position - no navigation needed
+        if not changed and self._proof_initialized and self._current_tactic_idx == tactics_to_replay:
+            actual_replayed = tactics_to_replay
+            used_checkpoint = True  # Skip other strategies
+
+        # Strategy 1: Use checkpoint + backup_n (fast path: ~80-130ms constant)
+        if not used_checkpoint and self._is_checkpoint_valid(self._active_theorem):
+            if await self._load_checkpoint_and_backup(self._active_theorem, tactics_to_replay):
+                actual_replayed = tactics_to_replay
+                used_checkpoint = True
+
+        # Strategy 2: Incremental navigation (when goaltree already initialized)
+        if not used_checkpoint and not changed and self._proof_initialized:
+            if tactics_to_replay < self._current_tactic_idx:
+                # Going backwards - use backup()
+                backup_failed = False
+                for _ in range(self._current_tactic_idx - tactics_to_replay):
+                    result = await self.session.send('backup();', timeout=5)
+                    if _is_hol_error(result):
+                        backup_failed = True
+                        break
+                if not backup_failed:
+                    self._current_tactic_idx = tactics_to_replay
+                    actual_replayed = tactics_to_replay
+                    used_checkpoint = True  # Skip full replay
+
+            elif tactics_to_replay > self._current_tactic_idx:
+                # Going forwards - replay only the delta (batched)
+                tactics_to_apply = self._active_tactics[self._current_tactic_idx:tactics_to_replay]
+                if tactics_to_apply:
+                    # goalstack: e(tactic) directly; goaltree: etq "tactic" (string parsed)
+                    if self._mode == "g":
+                        tactic_cmds = [f'e({t.text})' for t in tactics_to_apply]
+                    else:
+                        tactic_cmds = [f'etq "{escape_sml_string(t.text)}"' for t in tactics_to_apply]
+                    batch = "; ".join(tactic_cmds) + ";"
+                    result = await self.session.send(batch, timeout=300)
+                    if _is_hol_error(result):
+                        error_msg = f"Tactic replay failed (batch of {len(tactics_to_apply)}): {result[:200]}"
+                        # Don't know exact failure point in batch - reset to start
+                        self._proof_initialized = False
+                        used_checkpoint = False  # Force full replay to find exact error
+                    else:
+                        self._current_tactic_idx = tactics_to_replay
+                        actual_replayed = tactics_to_replay
+                        used_checkpoint = True  # Skip full replay
+                else:
+                    used_checkpoint = True
+
+            else:
+                # Same position - no replay needed
+                actual_replayed = tactics_to_replay
+                used_checkpoint = True  # Skip full replay
+
+        # Strategy 3: Full replay from start (creates checkpoint opportunity)
+        if not used_checkpoint:
+            await self.session.send('drop_all();', timeout=5)
+            goal = thm.goal.replace('\n', ' ').strip()
+            goal_cmd = "g" if self._mode == "g" else "gt"
+            gt_result = await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
+            if _is_hol_error(gt_result):
+                self._current_tactic_idx = 0
+                self._proof_initialized = False
+                return StateAtResult(
+                    goals=[], tactic_idx=tactic_idx, tactics_replayed=0,
+                    tactics_total=len(self._active_tactics), file_hash=self._content_hash,
+                    error=f"Failed to set up goal: {gt_result[:300]}"
+                )
+            self._proof_initialized = True
+
+            # Replay all tactics (to end of proof) for checkpoint, then backup
+            total_tactics = len(self._active_tactics)
+
+            if total_tactics > 0:
+                # Batch all tactics in single send
+                # goalstack: e(tactic) directly; goaltree: etq "tactic" (string parsed)
+                if self._mode == "g":
+                    tactic_cmds = [f'e({t.text})' for t in self._active_tactics]
+                else:
+                    tactic_cmds = [f'etq "{escape_sml_string(t.text)}"' for t in self._active_tactics]
+                batch = "; ".join(tactic_cmds) + ";"
+                result = await self.session.send(batch, timeout=300)
+                if _is_hol_error(result):
+                    error_msg = f"Tactic batch failed ({total_tactics} tactics): {result[:200]}"
+                    # Fallback: replay individually to find exact error
+                    # Reset proof state first
+                    await self.session.send('drop_all();', timeout=5)
+                    await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
+                    actual_replayed = 0
+                    for i, tac in enumerate(self._active_tactics):
+                        if self._mode == "g":
+                            result = await self.session.send(f'e({tac.text});', timeout=300)
+                        else:
+                            tac_escaped = escape_sml_string(tac.text)
+                            result = await self.session.send(f'etq "{tac_escaped}";', timeout=300)
+                        if _is_hol_error(result):
+                            error_msg = f"Tactic {i+1} failed: {tac.text[:50]}"
+                            self._current_tactic_idx = i
+                            actual_replayed = i
+                            break
+                        actual_replayed = i + 1
+                    else:
+                        self._current_tactic_idx = actual_replayed
+                else:
+                    actual_replayed = total_tactics
+                    self._current_tactic_idx = total_tactics
+
+                    # Save checkpoint if we replayed all tactics successfully
+                    await self._save_end_of_proof_checkpoint(self._active_theorem, total_tactics)
+
+                    # Backup to target position if needed
+                    if tactics_to_replay < total_tactics:
+                        backups_needed = total_tactics - tactics_to_replay
+                        result = await self.session.send(f'backup_n {backups_needed};', timeout=30)
+                        if not _is_hol_error(result):
+                            self._current_tactic_idx = tactics_to_replay
+                            actual_replayed = tactics_to_replay
+
+        # Get current goals
+        goals_output = await self.session.send('top_goals();', timeout=10)
+        goals = self._parse_goals(goals_output)
+
+        return StateAtResult(
+            goals=goals,
+            tactic_idx=tactic_idx,
+            tactics_replayed=actual_replayed,
+            tactics_total=len(self._active_tactics),
+            file_hash=self._content_hash,
+            error=error_msg,
         )
 
-        if first_cheat_idx is None:
-            return "No cheats found - all theorems already proved"
-
-        thm = self.theorems[first_cheat_idx]
-
-        # Get and load dependencies
-        deps = await get_script_dependencies(self.file)
-        for dep in deps:
-            await self.session.send(f'load "{dep}";', timeout=60)
-
-        # Load script content up to first cheat
-        content = self.file.read_text()
-        prefix = get_executable_content(content, thm.start_line)
-
-        if prefix.strip():
-            await self.session.send(prefix, timeout=300)
-
-        self._loaded_to_line = thm.start_line
-        self.position = first_cheat_idx
-
-        # Compute cheat_line for all theorems with cheats
-        await self._compute_cheat_lines()
-
-        return f"Positioned at {thm.name} (line {thm.cheat_line or thm.start_line})"
-
-    async def _compute_cheat_lines(self) -> None:
-        """Compute cheat_line for all theorems using SML parser."""
-        for thm in self.theorems:
-            if thm.has_cheat and thm.proof_body:
-                escaped = escape_sml_string(thm.proof_body)
-                result = await self.session.send(
-                    f'linearize_to_cheat "{escaped}";', timeout=30
-                )
-                _, offset = _parse_linearize_result(result)
-                if offset is not None:
-                    thm.cheat_line = thm.proof_start_line + thm.proof_body[:offset].count('\n')
-
-    async def load_context_to(self, target_line: int) -> None:
-        """Load file content from current loaded position to target line."""
-        if target_line <= self._loaded_to_line:
-            return  # Already loaded
-
-        content = self.file.read_text()
-        lines = content.split('\n')
-
-        # Get content between loaded position and target
-        # _loaded_to_line is 1-indexed line number of first unloaded line
-        # Convert to 0-indexed: line N is at index N-1
-        additional = '\n'.join(lines[self._loaded_to_line - 1:target_line - 1])
-
-        if additional.strip():
-            await self.session.send(additional, timeout=300)
-
-        self._loaded_to_line = target_line
-
-    async def start_current(self) -> str:
-        """Set up goaltree for current theorem, replay tactics to cheat point."""
-        thm = self.current()
-        if not thm:
-            return "ERROR: No current theorem"
-
-        # Load any context between previous position and this theorem
-        # (e.g., definitions between theorem A and B)
-        await self.load_context_to(thm.start_line)
-
-        # Clear all proof state unconditionally
-        await self.session.send('drop_all();', timeout=5)
-
-        # Set up goal
-        goal = thm.goal.replace('\n', ' ').strip()
-        result = await self.session.send(f'gt `{goal}`;', timeout=30)
-
-        if _is_hol_error(result):
-            return f"ERROR setting up goal: {result[:500]}"
-
-        # Get pre-cheat tactics using TacticParse
-        if thm.has_cheat and thm.proof_body:
-            escaped_body = escape_sml_string(thm.proof_body)
-
-            # linearize_to_cheat returns (tactics, cheat_offset)
-            lin_result = await self.session.send(
-                f'linearize_to_cheat "{escaped_body}";', timeout=30
-            )
-            tactics, cheat_offset = _parse_linearize_result(lin_result)
-
-            # Calculate cheat line from SML-provided offset (authoritative)
-            if cheat_offset is not None:
-                cheat_line = thm.proof_start_line + thm.proof_body[:cheat_offset].count('\n')
-                thm.cheat_line = cheat_line  # Store for status displays
-            else:
-                cheat_line = thm.cheat_line or thm.proof_start_line
-
-            if tactics:
-                # Replay each tactic in sequence
-                for i, tac in enumerate(tactics):
-                    tac_escaped = escape_sml_string(tac)
-                    tac_result = await self.session.send(f'etq "{tac_escaped}";', timeout=300)
-                    if _is_hol_error(tac_result):
-                        return f"ERROR replaying tactic {i+1}/{len(tactics)} '{tac}': {tac_result[:300]}"
-                return (f"Ready: {thm.name} (at cheat line {cheat_line}, "
-                        f"{len(tactics)} tactics auto-applied from file)")
-
-            # No tactics before cheat (cheat is first thing)
-            if cheat_offset is not None:
-                return f"Ready: {thm.name} (at cheat line {cheat_line})"
-
-            # Fall back to extract_before_cheat as safety net.
-            # In practice, linearize_to_cheat handles all cases extract_before_cheat
-            # can handle (plus nested ones). We keep this fallback but can't construct
-            # a test case where it triggers - both use the same TacticParse AST.
-            extract_result = await self.session.send(
-                f'extract_before_cheat "{escaped_body}";', timeout=30
-            )
-            before_cheat = _parse_sml_string(extract_result)
-            if before_cheat:
-                tac_result = await self.session.send(f'etq "{before_cheat}";', timeout=300)
-                if _is_hol_error(tac_result):
-                    return f"ERROR replaying tactics: {tac_result[:300]}"
-                line = thm.cheat_line or thm.proof_start_line
-                return (f"Ready: {thm.name} (at cheat line {line}, "
-                        f"tactics auto-applied from file)")
-
-        if thm.has_cheat:
-            line = thm.cheat_line or thm.proof_start_line
-            return f"Ready: {thm.name} (at cheat line {line})"
-        return f"Ready: {thm.name}"
-
-    async def extract_proof(self) -> dict:
-        """Extract proof via p() and drop goal.
-
-        Does NOT modify the filesystem - agent is responsible for splicing.
-
-        Returns dict with:
-          - proof: the tactic script from p()
-          - theorem: name of theorem
-          - error: error message if failed (other fields absent)
-        """
-        thm = self.current()
-        if not thm:
-            return {"error": "No current theorem"}
-
-        # Get proof from p()
-        p_output = await self.session.send("p();", timeout=30)
-        tactic_script = parse_p_output(p_output)
-
-        if not tactic_script:
-            return {"error": f"No proof found. Output:\n{p_output}"}
-
-        # Reject proofs with <anonymous> tactics (agent used e() instead of etq)
-        if "<anonymous>" in tactic_script:
-            return {
-                "error": "Proof contains <anonymous> tactics. "
-                "Use etq instead of e() to record tactic names."
-            }
-
-        # Drop goal
-        await self.session.send("drop();", timeout=5)
-
-        # NOTE: We do NOT advance _loaded_to_line here. The theorem was proved
-        # interactively, but the agent will splice the proof into the file.
-        # When hol_cursor_reenter calls load_context_to for the next theorem,
-        # it will load this theorem's block from the (edited) file, storing
-        # the theorem in HOL's context for subsequent proofs to reference.
-
-        return {"proof": tactic_script, "theorem": thm.name}
+    def _parse_goals(self, output: str) -> list[str]:
+        """Parse goal list from top_goals() output."""
+        # Output format: val it = [(asms, "goal"), ...]: goal list
+        # Simplified: just return the raw output for now
+        # TODO: proper parsing if needed
+        if "[]" in output:
+            return []
+        # Extract goal strings (rough parsing)
+        goals = []
+        for line in output.split('\n'):
+            if '"' in line:
+                # Extract quoted goal
+                start = line.find('"')
+                end = line.rfind('"')
+                if start < end:
+                    goals.append(line[start+1:end])
+        return goals if goals else [output.strip()]
 
     @property
     def status(self) -> dict:
-        """Get cursor status.
+        """Get cursor status."""
+        self._reparse_if_changed()
+        stale = self._check_stale_state()
 
-        Note: 'cheats' reflects actual file state (theorems with has_cheat=True),
-        not filtered by self.completed. This ensures ground truth after reparses.
-        """
-        current = self.current()
-        # Use file state only - self.completed is for navigation, not display
-        # cheat_line is set by SML parser; falls back to proof_start_line before that
-        cheated_theorems = [
-            {"name": t.name, "line": t.cheat_line or t.proof_start_line}
-            for t in self.theorems
-            if t.has_cheat
-        ]
         return {
             "file": str(self.file),
-            "current": current.name if current else None,
-            "current_line": current.start_line if current else None,
-            "position": f"{self.position + 1}/{len(self.theorems)}",
-            "completed": list(self.completed),
-            "cheated_theorems": cheated_theorems,
+            "file_hash": self._content_hash,
+            "active_theorem": self._active_theorem,
+            "active_tactics": len(self._active_tactics),
+            "loaded_to_line": self._loaded_to_line,
+            "stale": stale,
+            "completed": list(self._completed),
+            "theorems": [
+                {"name": t.name, "line": t.start_line, "has_cheat": t.has_cheat}
+                for t in self._theorems
+            ],
+            "cheats": [
+                {"theorem": t.name, "line": t.proof_start_line, "col": 1}
+                for t in self._theorems if t.has_cheat and t.name not in self._completed
+            ],
         }

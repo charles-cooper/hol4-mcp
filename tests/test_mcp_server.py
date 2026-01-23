@@ -16,9 +16,9 @@ from hol4_mcp.hol_mcp_server import (
     hol_log as _hol_log,
     hol_logs as _hol_logs,
     holmake as _holmake,
-    hol_cursor_init as _hol_cursor_init,
-    hol_cursor_status as _hol_cursor_status,
-    hol_cursor_goto as _hol_cursor_goto,
+    hol_file_init as _hol_file_init,
+    hol_state_at as _hol_state_at,
+    hol_file_status as _hol_file_status,
     _kill_process_group,
 )
 
@@ -30,9 +30,9 @@ hol_stop = _hol_stop.fn
 hol_log = _hol_log.fn
 hol_logs = _hol_logs.fn
 holmake = _holmake.fn
-hol_cursor_init = _hol_cursor_init.fn
-hol_cursor_status = _hol_cursor_status.fn
-hol_cursor_goto = _hol_cursor_goto.fn
+hol_file_init = _hol_file_init.fn
+hol_state_at = _hol_state_at.fn
+hol_file_status = _hol_file_status.fn
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -207,133 +207,42 @@ async def test_holmake_env_in_output(workdir):
 
 
 # =============================================================================
-# Cursor MCP Tool Tests
+# File Cursor MCP Tool Tests
 # =============================================================================
 
 
-async def test_cursor_init_start_at(tmp_path):
-    """Test hol_cursor_init with start_at parameter."""
-    # Copy fixture to temp dir
+async def test_file_init_lists_theorems(tmp_path):
+    """Test hol_file_init parses file and lists theorems."""
     test_file = tmp_path / "testScript.sml"
     shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
 
     try:
-        # Init at second cheat (partial_proof)
-        result = await hol_cursor_init(
-            file=str(test_file),
-            session="cursor_test",
-            start_at="partial_proof"
-        )
-        assert "partial_proof" in result
-        assert "Proving partial_proof" in result
-        # Should show goals
-        assert "goal" in result.lower() or "+" in result
-    finally:
-        await hol_stop(session="cursor_test")
-
-
-async def test_cursor_status_shows_cheats(tmp_path):
-    """Test hol_cursor_status lists all cheats."""
-    test_file = tmp_path / "testScript.sml"
-    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
-
-    try:
-        await hol_cursor_init(file=str(test_file), session="status_test")
-        result = await hol_cursor_status(session="status_test")
-
-        # Should list both cheats
+        result = await hol_file_init(file=str(test_file), session="file_init_test")
+        assert "Theorems:" in result
         assert "needs_proof" in result
         assert "partial_proof" in result
-        # Should show line numbers
-        assert "line" in result.lower()
-        # Should show current marker
-        assert "<--" in result
+        assert "[CHEAT]" in result
+    finally:
+        await hol_stop(session="file_init_test")
+
+
+async def test_file_status_shows_cheats(tmp_path):
+    """Test hol_file_status lists cheats and active theorem."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+
+    try:
+        await hol_file_init(file=str(test_file), session="status_test")
+        result = await hol_file_status(session="status_test")
+
+        # Should show file info
+        assert "File:" in result
+        assert "Progress:" in result
+        # Should list cheats
+        assert "needs_proof" in result
+        assert "partial_proof" in result
     finally:
         await hol_stop(session="status_test")
-
-
-async def test_cursor_goto(tmp_path):
-    """Test hol_cursor_goto jumps between theorems."""
-    test_file = tmp_path / "testScript.sml"
-    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
-
-    try:
-        # Init at first cheat
-        await hol_cursor_init(file=str(test_file), session="goto_test")
-
-        # Jump to second cheat
-        result = await hol_cursor_goto(session="goto_test", theorem_name="partial_proof")
-        assert "Jumped to partial_proof" in result
-        assert "goal" in result.lower() or "+" in result
-
-        # Jump back to first
-        result = await hol_cursor_goto(session="goto_test", theorem_name="needs_proof")
-        assert "Jumped to needs_proof" in result
-
-        # Non-existent theorem
-        result = await hol_cursor_goto(session="goto_test", theorem_name="nonexistent")
-        assert "ERROR" in result
-        assert "not found" in result
-        assert "Available cheats:" in result
-    finally:
-        await hol_stop(session="goto_test")
-
-
-async def test_cursor_goto_loads_context(tmp_path):
-    """Test that goto loads context (earlier theorems) when jumping forward."""
-    test_file = tmp_path / "testScript.sml"
-    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
-
-    try:
-        # Init at first cheat (needs_proof at line 18)
-        await hol_cursor_init(file=str(test_file), session="ctx_test")
-
-        # Jump to second cheat (partial_proof at line 25)
-        # This should load add_zero theorem (lines 11-15) into context
-        await hol_cursor_goto(session="ctx_test", theorem_name="partial_proof")
-
-        # Verify add_zero is available in HOL context
-        result = await hol_send(session="ctx_test", command="add_zero;", timeout=10)
-        # Should return the theorem, not an error
-        assert "⊢" in result or "thm" in result.lower()
-        assert "not found" not in result.lower()
-        assert "error" not in result.lower()
-    finally:
-        await hol_stop(session="ctx_test")
-
-
-async def test_cursor_goto_loads_intermediate_theorems(tmp_path):
-    """Test that goto loads intermediate theorems via load_context_to.
-
-    Regression test for off-by-one bug in load_context_to where
-    lines[_loaded_to_line:...] was used instead of lines[_loaded_to_line - 1:...],
-    causing the first line of intermediate content to be skipped.
-    """
-    test_file = tmp_path / "testScript.sml"
-    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
-
-    try:
-        # Init at first cheat (needs_proof at line 18)
-        # This loads lines 1-17 (including add_zero at lines 11-15)
-        await hol_cursor_init(file=str(test_file), session="intermediate_test")
-
-        # Jump to partial_proof (line 25)
-        # This should load lines 18-24 via load_context_to
-        # Line 18 is "Theorem needs_proof:" - must not be skipped!
-        await hol_cursor_goto(session="intermediate_test", theorem_name="partial_proof")
-
-        # Verify needs_proof (line 18) was loaded - this is the regression test
-        # DB.find returns [] if not found
-        result = await hol_send(
-            session="intermediate_test",
-            command='DB.find "needs_proof";',
-            timeout=10,
-        )
-        assert "needs_proof" in result, f"needs_proof should be in DB, got: {result}"
-        assert "[]" not in result, f"needs_proof should not return empty list: {result}"
-
-    finally:
-        await hol_stop(session="intermediate_test")
 
 
 # =============================================================================

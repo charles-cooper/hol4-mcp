@@ -4,7 +4,7 @@ import pytest
 from pathlib import Path
 
 from hol4_mcp.hol_session import HOLSession, escape_sml_string
-from hol4_mcp.hol_cursor import _is_hol_error, _parse_sml_string, _parse_linearize_result
+from hol4_mcp.hol_cursor import _is_hol_error
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -173,52 +173,3 @@ def test_is_hol_error_detects_error_prefix():
     """_is_hol_error catches ERROR: sentinel outputs."""
     assert _is_hol_error("ERROR: HOL not running")
     assert _is_hol_error("Error: HOL not running")
-
-
-def test_parse_sml_string_with_space():
-    """_parse_sml_string handles space before colon."""
-    # No space before colon
-    assert _parse_sml_string('val it = "hello": string') == "hello"
-    # Space before colon (Poly/ML format)
-    assert _parse_sml_string('val it = "hello" : string') == "hello"
-    # With escapes
-    assert _parse_sml_string('val it = "a\\\\b": string') == "a\\\\b"
-
-
-def test_parse_linearize_result_with_tactics_and_offset():
-    """_parse_linearize_result extracts tactics and offset."""
-    output = 'val it = (["strip_tac", "simp[]"], SOME 25): string list * int option'
-    tactics, offset = _parse_linearize_result(output)
-    assert tactics == ["strip_tac", "simp[]"]
-    assert offset == 25
-
-
-def test_parse_linearize_result_empty_list_with_offset():
-    """_parse_linearize_result handles empty tactics with offset (cheat is first)."""
-    output = 'val it = ([], SOME 0): string list * int option'
-    tactics, offset = _parse_linearize_result(output)
-    assert tactics == []
-    assert offset == 0
-
-
-def test_parse_linearize_result_no_cheat():
-    """_parse_linearize_result handles no cheat (NONE offset)."""
-    output = 'val it = ([], NONE): string list * int option'
-    tactics, offset = _parse_linearize_result(output)
-    assert tactics == []
-    assert offset is None
-
-
-def test_parse_linearize_result_with_escapes():
-    """_parse_linearize_result handles escaped strings."""
-    output = 'val it = (["simp[foo_def]", "gvs[]"], SOME 42): string list * int option'
-    tactics, offset = _parse_linearize_result(output)
-    assert tactics == ["simp[foo_def]", "gvs[]"]
-    assert offset == 42
-
-
-def test_parse_linearize_result_malformed():
-    """_parse_linearize_result returns empty on malformed input."""
-    tactics, offset = _parse_linearize_result("garbage")
-    assert tactics == []
-    assert offset is None
