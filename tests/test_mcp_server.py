@@ -245,6 +245,45 @@ async def test_file_status_shows_cheats(tmp_path):
         await hol_stop(session="status_test")
 
 
+async def test_file_init_restarts_on_workdir_change(tmp_path):
+    """Test hol_file_init restarts session when workdir changes.
+
+    Regression test for BUG_workdir_mismatch: when hol_file_init was called
+    with a different workdir, the session kept using the old workdir.
+    """
+    # Create two directories with test files
+    dir_a = tmp_path / "dirA"
+    dir_b = tmp_path / "dirB"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    file_a = dir_a / "testScript.sml"
+    file_b = dir_b / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", file_a)
+    shutil.copy(FIXTURES_DIR / "testScript.sml", file_b)
+
+    try:
+        # Start session in dir_a
+        result = await hol_file_init(file=str(file_a), session="workdir_test")
+        assert "Theorems:" in result
+
+        # Check workdir via sessions list
+        sessions = await hol_sessions()
+        assert "dirA" in sessions
+
+        # Now init for file in dir_b - should restart session
+        result = await hol_file_init(file=str(file_b), session="workdir_test", workdir=str(dir_b))
+        assert "Theorems:" in result
+
+        # Check workdir changed
+        sessions = await hol_sessions()
+        assert "dirB" in sessions
+        # Old workdir should not be present (session was restarted)
+        assert "dirA" not in sessions or "workdir_test" not in sessions.split("dirA")[0]
+    finally:
+        await hol_stop(session="workdir_test")
+
+
 async def test_state_at_returns_goals(tmp_path):
     """Test hol_state_at returns goals when called on a line inside a theorem."""
     test_file = tmp_path / "testScript.sml"

@@ -508,11 +508,21 @@ async def hol_file_init(
     if not file_path.exists():
         return f"ERROR: File not found: {file}"
 
-    # Auto-start session if needed
+    # Determine target workdir
+    target_workdir = Path(workdir).resolve() if workdir else file_path.parent
+
+    # Auto-start or restart session if workdir changed
     s = _get_session(session)
+    entry = _sessions.get(session)
+
+    if s and s.is_running:
+        # Check if workdir differs - need to restart
+        if entry and entry.workdir != target_workdir:
+            await hol_stop.fn(session)
+            s = None
+
     if not s or not s.is_running:
-        wd = workdir or str(file_path.parent)
-        start_result = await hol_start.fn(workdir=wd, name=session)
+        start_result = await hol_start.fn(workdir=str(target_workdir), name=session)
         if start_result.startswith("ERROR"):
             return start_result
         s = _get_session(session)
