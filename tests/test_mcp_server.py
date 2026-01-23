@@ -426,3 +426,40 @@ def _pid_exists(pid: int) -> bool:
         return False
     except PermissionError:
         return True  # Process exists but we can't signal it
+
+
+# =============================================================================
+# CLI Tests
+# =============================================================================
+
+
+import subprocess
+
+
+def test_cli_help():
+    """Test that hol4-mcp --help works."""
+    result = subprocess.run(
+        ["hol4-mcp", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "HOL4 MCP Server" in result.stdout
+    assert "--transport" in result.stdout
+    assert "--port" in result.stdout
+
+
+def test_cli_main_function():
+    """Test the main() function can be imported and called with --help."""
+    from hol4_mcp.hol_mcp_server import main
+    import sys
+
+    # Temporarily replace sys.argv
+    old_argv = sys.argv
+    try:
+        sys.argv = ["hol4-mcp", "--help"]
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 0
+    finally:
+        sys.argv = old_argv

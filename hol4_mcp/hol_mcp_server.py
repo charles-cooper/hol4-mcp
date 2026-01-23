@@ -655,7 +655,7 @@ def _install_pi_extension():
 
 
 def main():
-    """Entry point for the HOL4 MCP server."""
+    """CLI entry point for HOL4 MCP server."""
     import argparse
     import logging
 
