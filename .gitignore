@@ -8,3 +8,4 @@ build/
 .agent-files/
 .agent-files.git/
 node_modules/
+uv.lock
