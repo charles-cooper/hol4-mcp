@@ -611,13 +611,13 @@ class FileProofCursor:
                 batch = "; ".join(tactic_cmds) + ";"
                 result = await self.session.send(batch, timeout=300)
                 if _is_hol_error(result):
-                    error_msg = f"Tactic batch failed ({total_tactics} tactics): {result[:200]}"
-                    # Fallback: replay individually to find exact error
-                    # Reset proof state first
+                    # Fallback: replay individually up to requested position
+                    # Only report error if it's at or before the requested position
                     await self.session.send('drop_all();', timeout=5)
                     await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
                     actual_replayed = 0
-                    for i, tac in enumerate(self._active_tactics):
+                    # Only replay up to tactics_to_replay, not all tactics
+                    for i, tac in enumerate(self._active_tactics[:tactics_to_replay]):
                         if self._mode == "g":
                             result = await self.session.send(f'e({tac.text});', timeout=300)
                         else:
