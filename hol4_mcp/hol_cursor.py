@@ -8,7 +8,7 @@ from pathlib import Path
 from .hol_file_parser import (
     TheoremInfo, parse_file, parse_p_output, parse_theorems,
     TacticSpan, build_line_starts, parse_linearize_with_spans_output,
-    make_tactic_spans, offset_to_line_col,
+    make_tactic_spans, offset_to_line_col, HOLParseError,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -408,7 +408,10 @@ class FileProofCursor:
             lin_result = await self.session.send(
                 f'linearize_with_spans_json "{escaped_body}";', timeout=30
             )
-            raw_spans = parse_linearize_with_spans_output(lin_result)
+            try:
+                raw_spans = parse_linearize_with_spans_output(lin_result)
+            except HOLParseError as e:
+                return {"error": f"Failed to parse tactics: {e}"}
 
             # Calculate proof body offset in file
             # Find where proof body starts (after "Proof\n")
@@ -486,7 +489,14 @@ class FileProofCursor:
                 lin_result = await self.session.send(
                     f'linearize_with_spans_json "{escaped_body}";', timeout=30
                 )
-                raw_spans = parse_linearize_with_spans_output(lin_result)
+                try:
+                    raw_spans = parse_linearize_with_spans_output(lin_result)
+                except HOLParseError as e:
+                    return StateAtResult(
+                        goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
+                        file_hash=self._content_hash,
+                        error=f"Failed to parse tactics: {e}"
+                    )
                 proof_start_offset = self._content.find(
                     thm.proof_body,
                     self._line_starts[thm.proof_start_line - 1] if thm.proof_start_line <= len(self._line_starts) else 0
@@ -638,7 +648,11 @@ class FileProofCursor:
 
         # Get current goals as JSON
         goals_output = await self.session.send('goals_json();', timeout=10)
-        goals = self._parse_goals_json(goals_output)
+        try:
+            goals = self._parse_goals_json(goals_output)
+        except HOLParseError as e:
+            goals = []
+            error_msg = str(e) if not error_msg else f"{error_msg}; {e}"
 
         return StateAtResult(
             goals=goals,
@@ -653,22 +667,21 @@ class FileProofCursor:
         """Parse JSON goal output from goals_json().
 
         Output format: {"ok":["goal1", ...]} or {"err":"message"}
-        Returns goals list, or empty list with error logged.
+        Raises: HOLParseError if HOL4 returned an error or output is malformed.
         """
         import json
-        import logging
+
         try:
             result = json.loads(output.strip().split('\n')[0])
-            if 'ok' in result:
-                return result['ok']
-            elif 'err' in result:
-                logging.warning(f"goals_json error: {result['err']}")
-                return []
-            else:
-                return []
         except (ValueError, json.JSONDecodeError) as e:
-            logging.warning(f"Failed to parse goals_json output: {e}")
-            return []
+            raise HOLParseError(f"Invalid JSON from goals_json: {e}") from e
+
+        if 'ok' in result:
+            return result['ok']
+        elif 'err' in result:
+            raise HOLParseError(f"goals_json: {result['err']}")
+        else:
+            raise HOLParseError(f"Unexpected JSON structure: {result}")
 
     @property
     def status(self) -> dict:

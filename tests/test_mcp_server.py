@@ -472,6 +472,7 @@ import subprocess
 def test_parse_goals_json():
     """Test _parse_goals_json parses goals_json() output correctly."""
     from hol4_mcp.hol_cursor import FileProofCursor
+    from hol4_mcp.hol_file_parser import HOLParseError
 
     # Create a minimal cursor just to test the parsing method
     class MockCursor(FileProofCursor):
@@ -492,11 +493,16 @@ def test_parse_goals_json():
     # Complex goal with symbols
     assert cursor._parse_goals_json('{"ok":["B ⇒ A ∧ B"]}\n') == ['B ⇒ A ∧ B']
 
-    # Error case
-    assert cursor._parse_goals_json('{"err":"NO_PROOFS"}\n') == []
+    # Error case - should raise exception
+    with pytest.raises(HOLParseError, match="NO_PROOFS"):
+        cursor._parse_goals_json('{"err":"NO_PROOFS"}\n')
 
     # With trailing val it = (): unit
     assert cursor._parse_goals_json('{"ok":["goal"]}\nval it = (): unit\n') == ['goal']
+
+    # Invalid JSON should raise exception
+    with pytest.raises(HOLParseError):
+        cursor._parse_goals_json('not json at all')
 
 
 def test_cli_help():

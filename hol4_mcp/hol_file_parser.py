@@ -42,27 +42,34 @@ def line_col_to_offset(line: int, col: int, line_starts: list[int]) -> int:
     return line_starts[line - 1] + col - 1
 
 
+class HOLParseError(Exception):
+    """Error parsing HOL4 output."""
+    pass
+
+
 def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int]]:
     """Parse JSON output from linearize_with_spans_json.
 
     Expects: {"ok":[{"t":"text","s":0,"e":8},...]} or {"err":"message"}
     Returns: list of (text, start_offset, end_offset) tuples.
+    Raises: HOLParseError if HOL4 returned an error or output is malformed.
     """
     import json
-    import logging
 
     try:
         result = json.loads(output.strip().split('\n')[0])
-        if 'ok' in result:
+    except (ValueError, json.JSONDecodeError) as e:
+        raise HOLParseError(f"Invalid JSON from linearize_with_spans_json: {e}") from e
+
+    if 'ok' in result:
+        try:
             return [(item['t'], item['s'], item['e']) for item in result['ok']]
-        elif 'err' in result:
-            logging.warning(f"linearize_with_spans_json error: {result['err']}")
-            return []
-        else:
-            return []
-    except (ValueError, json.JSONDecodeError, KeyError) as e:
-        logging.warning(f"Failed to parse linearize_with_spans_json: {e}")
-        return []
+        except (KeyError, TypeError) as e:
+            raise HOLParseError(f"Malformed tactic span in output: {e}") from e
+    elif 'err' in result:
+        raise HOLParseError(f"linearize_with_spans_json: {result['err']}")
+    else:
+        raise HOLParseError(f"Unexpected JSON structure: {result}")
 
 
 def make_tactic_spans(
