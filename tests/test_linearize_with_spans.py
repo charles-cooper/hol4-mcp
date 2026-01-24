@@ -93,6 +93,33 @@ class TestLinearizeByConstruct:
         # The `by` item should contain both the goal and tactic
         assert any("`P x`" in r[0] and "simp[]" in r[0] for r in by_items)
 
+    async def test_by_span_offset_not_zero(self, hol_session):
+        """`by` construct mid-proof should have correct span offset, not 0.
+
+        Regression test for Bug 1: node_span didn't handle TacticParse.Subgoal,
+        causing `by` constructs to have start offset 0 (incorrectly including
+        all preceding tactics in the span text).
+        """
+        tactic = "rpt strip_tac >> `P x` by simp[]"
+        result = await call_linearize(hol_session, tactic)
+
+        # Find the `by` item
+        by_items = [r for r in result if "by" in r[0]]
+        assert len(by_items) == 1
+
+        text, start, end, use_eall = by_items[0]
+
+        # The `by` construct should NOT start at 0 - it comes after "rpt strip_tac >> "
+        assert start > 0, f"`by` construct should not start at offset 0, got start={start}"
+
+        # Verify the span text matches what we extract from the original
+        extracted = tactic[start:end]
+        assert "`P x`" in extracted
+        assert "simp[]" in extracted
+        # Should NOT include the earlier tactics
+        assert "rpt" not in extracted
+        assert "strip_tac" not in text  # The returned text should only be the `by` construct
+
 
 class TestLinearizeThenInThenLT:
     """Tests for Then nodes inside ThenLT - the bug that was fixed."""

@@ -81,6 +81,7 @@ fun linearize_with_spans source = let
     | node_span (TacticParse.Opaque (_, span)) = span
     | node_span (TacticParse.LOpaque (_, span)) = span
     | node_span (TacticParse.OOpaque (_, span)) = span
+    | node_span (TacticParse.Subgoal span) = span  (* by/suffices_by quotation *)
     | node_span (TacticParse.LThen1 inner) = node_span inner
     | node_span (TacticParse.Try inner) = node_span inner
     | node_span (TacticParse.LTry inner) = node_span inner
