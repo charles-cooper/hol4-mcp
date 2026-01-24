@@ -630,6 +630,14 @@ async def hol_state_at(
 
     lines = []
     
+    # Check if "no goals" error is actually success (proof complete)
+    is_proof_complete = (
+        result.error and 
+        "no goals" in result.error.lower() and
+        result.tactics_replayed == result.tactics_total and
+        not result.goals
+    )
+    
     # Show position info - clarify if we couldn't reach requested position
     if result.error and result.tactics_replayed < result.tactic_idx:
         lines.append(f"Requested: Tactic {result.tactic_idx}/{result.tactics_total}")
@@ -639,7 +647,8 @@ async def hol_state_at(
         lines.append(f"=== Goals (after tactic {result.tactics_replayed}) ===")
     else:
         lines.append(f"Tactic {result.tactic_idx}/{result.tactics_total}")
-        if result.error:
+        # Don't show "no goals" as error when proof is complete
+        if result.error and not is_proof_complete:
             lines.append(f"\nERROR: {result.error}")
         lines.append("")
         lines.append("=== Goals ===")
