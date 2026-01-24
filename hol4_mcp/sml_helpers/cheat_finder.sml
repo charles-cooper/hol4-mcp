@@ -1,11 +1,53 @@
 (* cheat_finder.sml - Linearize tactics with spans for cursor navigation
 
    Usage:
-     linearize_with_spans "conj_tac >- simp[] \\\\ gvs[]"
-     => [("conj_tac", 0, 8), ("simp[]", 12, 18), ("gvs[]", 23, 28)]
+     linearize_with_spans_json "conj_tac >- simp[] \\\\ gvs[]"
+     => [{"t":"conj_tac","s":0,"e":8},{"t":"simp[]","s":12,"e":18}]
 
    Used by FileProofCursor to map file positions to proof state.
 *)
+
+(* Simple JSON string escaping for tactic text *)
+fun json_escape_char c =
+  case c of
+    #"\"" => "\\\""
+  | #"\\" => "\\\\"
+  | #"\n" => "\\n"
+  | #"\r" => "\\r"
+  | #"\t" => "\\t"
+  | _ => if Char.ord c < 32
+         then "\\u" ^ StringCvt.padLeft #"0" 4 (Int.fmt StringCvt.HEX (Char.ord c))
+         else String.str c
+
+fun json_escape_string s =
+  String.concat (map json_escape_char (String.explode s))
+
+(* Convert tactic span to JSON object: {"t":"text","s":start,"e":end} *)
+fun tactic_span_to_json (text, start_off, end_off) =
+  "{\"t\":\"" ^ json_escape_string text ^ 
+  "\",\"s\":" ^ Int.toString start_off ^ 
+  ",\"e\":" ^ Int.toString end_off ^ "}"
+
+(* Convert list of tactic spans to JSON array *)
+fun tactic_spans_to_json spans =
+  "[" ^ String.concatWith "," (map tactic_span_to_json spans) ^ "]"
+
+(* Convert a string to JSON string with quotes *)
+fun json_string s = "\"" ^ json_escape_string s ^ "\""
+
+(* Convert list of strings to JSON array *)
+fun json_string_array strs =
+  "[" ^ String.concatWith "," (map json_string strs) ^ "]"
+
+(* JSON result helpers: {"ok": ...} or {"err": "message"} *)
+fun json_ok payload = "{\"ok\":" ^ payload ^ "}"
+fun json_err msg = "{\"err\":" ^ json_string msg ^ "}"
+
+(* Print current goals as JSON: {"ok":["goal1",...]} or {"err":"message"} *)
+fun goals_json () = 
+  let val goals = map (term_to_string o snd) (top_goals())
+  in print (json_ok (json_string_array goals) ^ "\n") end
+  handle e => print (json_err (exnMessage e) ^ "\n");
 
 (* linearize_with_spans - Return list of (tactic, start, end) for navigation
 
@@ -191,4 +233,9 @@ fun linearize_with_spans source = let
     | go _ acc = acc
 in
   List.rev (go tree [])
-end handle _ => [];
+end;
+
+(* JSON output version: {"ok":[...]} or {"err":"message"} *)
+fun linearize_with_spans_json source =
+  print (json_ok (tactic_spans_to_json (linearize_with_spans source)) ^ "\n")
+  handle e => print (json_err (exnMessage e) ^ "\n");

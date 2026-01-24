@@ -582,18 +582,19 @@ async def hol_state_at(
     result = await cursor.state_at(line, col)
 
     lines = []
+    lines.append(f"Tactic {result.tactic_idx}/{result.tactics_total}")
+    lines.append(f"Replayed {result.tactics_replayed} tactics")
+
     if result.error:
-        lines.append(f"ERROR: {result.error}")
+        lines.append(f"\nERROR: {result.error}")
+
+    lines.append("")
+    if result.goals:
+        lines.append("=== Goals ===")
+        for g in result.goals:
+            lines.append(g)
     else:
-        lines.append(f"Tactic {result.tactic_idx}/{result.tactics_total}")
-        lines.append(f"Replayed {result.tactics_replayed} tactics")
-        lines.append("")
-        if result.goals:
-            lines.append("=== Goals ===")
-            for g in result.goals:
-                lines.append(g)
-        else:
-            lines.append("No goals (proof complete)")
+        lines.append("No goals (proof complete)")
 
     return "\n".join(lines)
 

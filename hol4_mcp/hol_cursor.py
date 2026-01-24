@@ -406,7 +406,7 @@ class FileProofCursor:
         if thm.proof_body:
             escaped_body = escape_sml_string(thm.proof_body)
             lin_result = await self.session.send(
-                f'linearize_with_spans "{escaped_body}";', timeout=30
+                f'linearize_with_spans_json "{escaped_body}";', timeout=30
             )
             raw_spans = parse_linearize_with_spans_output(lin_result)
 
@@ -484,7 +484,7 @@ class FileProofCursor:
             if thm.proof_body:
                 escaped_body = escape_sml_string(thm.proof_body)
                 lin_result = await self.session.send(
-                    f'linearize_with_spans "{escaped_body}";', timeout=30
+                    f'linearize_with_spans_json "{escaped_body}";', timeout=30
                 )
                 raw_spans = parse_linearize_with_spans_output(lin_result)
                 proof_start_offset = self._content.find(
@@ -636,9 +636,9 @@ class FileProofCursor:
                             self._current_tactic_idx = tactics_to_replay
                             actual_replayed = tactics_to_replay
 
-        # Get current goals - use map snd for cleaner parsing
-        goals_output = await self.session.send('map snd (top_goals());', timeout=10)
-        goals = self._parse_goal_terms(goals_output)
+        # Get current goals as JSON
+        goals_output = await self.session.send('goals_json();', timeout=10)
+        goals = self._parse_goals_json(goals_output)
 
         return StateAtResult(
             goals=goals,
@@ -649,25 +649,26 @@ class FileProofCursor:
             error=error_msg,
         )
 
-    def _parse_goal_terms(self, output: str) -> list[str]:
-        """Parse goal terms from 'map snd (top_goals())' output.
+    def _parse_goals_json(self, output: str) -> list[str]:
+        """Parse JSON goal output from goals_json().
 
-        Output format: val it = ["goal1", "goal2", ...]: term list
-        Empty: val it = []: term list
+        Output format: {"ok":["goal1", ...]} or {"err":"message"}
+        Returns goals list, or empty list with error logged.
         """
-        # Check for empty list
-        if "[]: term list" in output or "= []\n" in output:
+        import json
+        import logging
+        try:
+            result = json.loads(output.strip().split('\n')[0])
+            if 'ok' in result:
+                return result['ok']
+            elif 'err' in result:
+                logging.warning(f"goals_json error: {result['err']}")
+                return []
+            else:
+                return []
+        except (ValueError, json.JSONDecodeError) as e:
+            logging.warning(f"Failed to parse goals_json output: {e}")
             return []
-
-        # Extract quoted strings from the term list
-        # Format: val it = ["A ⇒ B", "C"]: term list
-        import re
-        goals = []
-        # Find all quoted strings - goals are simple quoted terms
-        for match in re.finditer(r'"([^"]*)"', output):
-            goals.append(match.group(1))
-
-        return goals if goals else [output.strip()]
 
     @property
     def status(self) -> dict:

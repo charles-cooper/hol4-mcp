@@ -29,7 +29,7 @@ async def hol_session():
 async def call_linearize(session: HOLSession, tactic_str: str) -> list[tuple[str, int, int]]:
     """Call linearize_with_spans and parse the result."""
     escaped = escape_sml_string(tactic_str)
-    result = await session.send(f'linearize_with_spans "{escaped}";', timeout=10)
+    result = await session.send(f'linearize_with_spans_json "{escaped}";', timeout=10)
     return parse_linearize_with_spans_output(result)
 
 

@@ -43,77 +43,26 @@ def line_col_to_offset(line: int, col: int, line_starts: list[int]) -> int:
 
 
 def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int]]:
-    """Parse SML output from linearize_with_spans.
+    """Parse JSON output from linearize_with_spans_json.
 
-    Expects: val it = [("text", start, end), ...]: (string * int * int) list
+    Expects: {"ok":[{"t":"text","s":0,"e":8},...]} or {"err":"message"}
     Returns: list of (text, start_offset, end_offset) tuples.
-
-    Note: HOL may output across multiple lines, so we join and search.
     """
-    # Join all lines - HOL output may span multiple lines
-    full_output = ' '.join(output.split())
+    import json
+    import logging
 
-    if 'val it =' not in full_output or '[' not in full_output:
-        return []
-
-    start = full_output.index('[')
-    # Find matching ] accounting for the type annotation
-    end = full_output.rindex(']') + 1
-    list_str = full_output[start:end]
-
-    if list_str == '[]':
-        return []
-
-    items = []
-    i = 1  # skip opening [
-    while i < len(list_str) - 1:
-        if list_str[i] == '(':
-            # Find matching )
-            depth = 1
-            j = i + 1
-            while depth > 0:
-                if list_str[j] == '(':
-                    depth += 1
-                elif list_str[j] == ')':
-                    depth -= 1
-                j += 1
-            tuple_str = list_str[i+1:j-1]
-
-            # Parse ("text", start, end)
-            # Find first "," after the quoted string
-            in_str = False
-            escaped = False
-            k = 0
-            while k < len(tuple_str):
-                c = tuple_str[k]
-                if escaped:
-                    escaped = False
-                elif c == '\\':
-                    escaped = True
-                elif c == '"':
-                    in_str = not in_str
-                elif not in_str and c == ',':
-                    break
-                k += 1
-
-            # Extract text (remove quotes, handle escapes)
-            text_part = tuple_str[1:k-1]  # strip quotes
-            # Unescape SML string escapes: \\ -> \, \" -> ", \n -> newline, \t -> tab
-            text_part = (text_part
-                .replace('\\\\', '\x00')  # Preserve \\ temporarily
-                .replace('\\n', '\n')     # Unescape newline
-                .replace('\\t', '\t')     # Unescape tab
-                .replace('\\"', '"')      # Unescape quote
-                .replace('\x00', '\\'))   # Restore \\
-
-            nums = tuple_str[k+1:].split(',')
-            start_off = int(nums[0].strip())
-            end_off = int(nums[1].strip())
-            items.append((text_part, start_off, end_off))
-            i = j
+    try:
+        result = json.loads(output.strip().split('\n')[0])
+        if 'ok' in result:
+            return [(item['t'], item['s'], item['e']) for item in result['ok']]
+        elif 'err' in result:
+            logging.warning(f"linearize_with_spans_json error: {result['err']}")
+            return []
         else:
-            i += 1
-    return items
+            return []
+    except (ValueError, json.JSONDecodeError, KeyError) as e:
+        logging.warning(f"Failed to parse linearize_with_spans_json: {e}")
+        return []
 
 
 def make_tactic_spans(

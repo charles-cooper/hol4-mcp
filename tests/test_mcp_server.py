@@ -469,8 +469,8 @@ def _pid_exists(pid: int) -> bool:
 import subprocess
 
 
-def test_parse_goal_terms():
-    """Test _parse_goal_terms parses HOL4 goal output correctly."""
+def test_parse_goals_json():
+    """Test _parse_goals_json parses goals_json() output correctly."""
     from hol4_mcp.hol_cursor import FileProofCursor
 
     # Create a minimal cursor just to test the parsing method
@@ -481,21 +481,22 @@ def test_parse_goal_terms():
     cursor = MockCursor()
 
     # Empty goals
-    assert cursor._parse_goal_terms('val it = []: term list\n') == []
+    assert cursor._parse_goals_json('{"ok":[]}\n') == []
 
     # Single goal
-    assert cursor._parse_goal_terms('val it = ["A ⇒ A"]: term list\n') == ['A ⇒ A']
+    assert cursor._parse_goals_json('{"ok":["A ⇒ A"]}\n') == ['A ⇒ A']
 
     # Multiple goals
-    assert cursor._parse_goal_terms('val it = ["A", "B"]: term list\n') == ['A', 'B']
+    assert cursor._parse_goals_json('{"ok":["A", "B"]}\n') == ['A', 'B']
 
     # Complex goal with symbols
-    result = cursor._parse_goal_terms('val it = ["B ⇒ A ∧ B"]: term list\n')
-    assert result == ['B ⇒ A ∧ B']
+    assert cursor._parse_goals_json('{"ok":["B ⇒ A ∧ B"]}\n') == ['B ⇒ A ∧ B']
 
-    # Regression test: empty list should not match embedded []
-    # (This was a bug where [([], "goal")] was parsed as empty because of "[]")
-    assert cursor._parse_goal_terms('val it = ["goal"]: term list\n') != []
+    # Error case
+    assert cursor._parse_goals_json('{"err":"NO_PROOFS"}\n') == []
+
+    # With trailing val it = (): unit
+    assert cursor._parse_goals_json('{"ok":["goal"]}\nval it = (): unit\n') == ['goal']
 
 
 def test_cli_help():
