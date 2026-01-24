@@ -80,6 +80,7 @@ class StateAtResult:
     tactics_total: int        # Total tactics in proof
     file_hash: str            # Content hash when this state was computed
     error: str | None = None  # Error message if replay failed
+    timings: dict[str, float] | None = None  # Timing breakdown (ms)
 
 
 @dataclass
@@ -452,8 +453,13 @@ class FileProofCursor:
         Returns:
             StateAtResult with goals, tactic index, etc.
         """
+        import time
+        timings: dict[str, float] = {}
+        t0 = time.perf_counter()
+
         # Reparse if file changed
         changed = self._reparse_if_changed()
+        timings['reparse'] = time.perf_counter() - t0
 
         # Find theorem at position and auto-enter if needed
         thm_at_pos = self._get_theorem_at_position(line)
@@ -465,6 +471,7 @@ class FileProofCursor:
             )
 
         # Auto-enter theorem if different from active
+        t1 = time.perf_counter()
         if self._active_theorem != thm_at_pos.name:
             enter_result = await self.enter_theorem(thm_at_pos.name)
             if "error" in enter_result:
@@ -473,6 +480,7 @@ class FileProofCursor:
                     file_hash=self._content_hash, error=enter_result["error"]
                 )
             changed = True  # Force re-check since we just entered
+        timings['enter_theorem'] = time.perf_counter() - t1
 
         thm = self._get_theorem(self._active_theorem)
         if not thm:
@@ -482,6 +490,7 @@ class FileProofCursor:
             )
 
         # If file changed, invalidate checkpoint and re-parse tactics
+        t2 = time.perf_counter()
         if changed:
             self._invalidate_checkpoint(self._active_theorem)
             if thm.proof_body:
@@ -504,6 +513,7 @@ class FileProofCursor:
                 if proof_start_offset == -1:
                     proof_start_offset = 0
                 self._active_tactics = make_tactic_spans(raw_spans, proof_start_offset, self._line_starts)
+        timings['linearize'] = time.perf_counter() - t2
 
         # Check if position is within theorem bounds
         proof_keyword_line = thm.proof_start_line - 1
@@ -527,6 +537,8 @@ class FileProofCursor:
         error_msg = None
         actual_replayed = 0
         used_checkpoint = False
+        strategy_used = "none"
+        t3 = time.perf_counter()
 
         # Strategy 0: Already at target position - no navigation needed
         if not changed and self._proof_initialized and self._current_tactic_idx == tactics_to_replay:
@@ -646,13 +658,19 @@ class FileProofCursor:
                             self._current_tactic_idx = tactics_to_replay
                             actual_replayed = tactics_to_replay
 
+        timings['strategy'] = time.perf_counter() - t3
+
         # Get current goals as JSON
+        t4 = time.perf_counter()
         goals_output = await self.session.send('goals_json();', timeout=10)
         try:
             goals = self._parse_goals_json(goals_output)
         except HOLParseError as e:
             goals = []
             error_msg = str(e) if not error_msg else f"{error_msg}; {e}"
+        timings['goals'] = time.perf_counter() - t4
+
+        timings['total'] = time.perf_counter() - t0
 
         return StateAtResult(
             goals=goals,
@@ -661,6 +679,7 @@ class FileProofCursor:
             tactics_total=len(self._active_tactics),
             file_hash=self._content_hash,
             error=error_msg,
+            timings=timings,
         )
 
     def _parse_goals_json(self, output: str) -> list[str]:

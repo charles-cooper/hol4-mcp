@@ -229,7 +229,7 @@ async def hol_restart(session: str) -> str:
     Args:
         session: Session name to restart
 
-    Returns: Same as hol_start (session info + proof state)
+    Returns: Same as hol_start (cursor is cleared, use hol_file_init to re-init)
     """
     entry = _sessions.get(session)
     if not entry:
@@ -610,7 +610,7 @@ async def hol_state_at(
             cursor = _get_cursor(session)
 
     if not cursor:
-        return f"ERROR: No cursor for session '{session}'. Use hol_file_init first."
+        return f"ERROR: No cursor for session '{session}'. Use hol_file_init first, or pass file= to auto-init."
 
     result = await cursor.state_at(line, col)
 
@@ -643,7 +643,7 @@ async def hol_file_status(session: str) -> str:
     """
     cursor = _get_cursor(session)
     if not cursor:
-        return f"ERROR: No cursor for session '{session}'. Use hol_file_init first."
+        return f"ERROR: No cursor for session '{session}'. Use hol_file_init first, or pass file= to auto-init."
 
     status = cursor.status
 
