@@ -318,6 +318,27 @@ async def test_state_at_outside_theorem(tmp_path):
         await hol_stop(session="outside_test")
 
 
+async def test_state_at_auto_init(tmp_path):
+    """Test hol_state_at with file parameter auto-calls hol_file_init."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+
+    session_name = "auto_init_test"
+    await hol_stop(session=session_name)  # Ensure clean state
+
+    try:
+        # Call hol_state_at with file parameter - should auto-init
+        result = await hol_state_at(
+            session=session_name, line=21, col=1, file=str(test_file)
+        )
+
+        # Should work without explicit hol_file_init
+        assert "Tactic" in result
+        assert "ERROR: No cursor" not in result
+    finally:
+        await hol_stop(session=session_name)
+
+
 async def test_file_init_auto_starts_session(tmp_path):
     """Test hol_file_init auto-starts HOL session if not running."""
     test_file = tmp_path / "testScript.sml"

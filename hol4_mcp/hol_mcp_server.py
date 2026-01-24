@@ -563,6 +563,8 @@ async def hol_state_at(
     session: str,
     line: int,
     col: int = 1,
+    file: str = None,
+    workdir: str = None,
 ) -> str:
     """Get proof state at file position.
 
@@ -572,10 +574,24 @@ async def hol_state_at(
         session: Session name
         line: 1-indexed line number
         col: 1-indexed column number (default 1)
+        file: Optional path to .sml file (auto-calls hol_file_init if provided)
+        workdir: Optional working directory (used with file)
 
     Returns: Goals, tactic index, error info
     """
     cursor = _get_cursor(session)
+
+    # Auto-init if file provided and no cursor (or different file)
+    if file:
+        file_path = Path(file).resolve()
+        if not cursor or Path(cursor.file).resolve() != file_path:
+            init_result = await hol_file_init.fn(
+                file=file, session=session, workdir=workdir
+            )
+            if init_result.startswith("ERROR"):
+                return init_result
+            cursor = _get_cursor(session)
+
     if not cursor:
         return f"ERROR: No cursor for session '{session}'. Use hol_file_init first."
 
