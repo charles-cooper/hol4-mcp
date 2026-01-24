@@ -662,6 +662,10 @@ async def hol_state_at(
                     lines.append(f"  {asm}")
                 lines.append("  " + "-" * 40)
             lines.append(f"  {g['goal']}")
+    elif is_proof_complete:
+        lines.append("No goals (proof complete)")
+    elif result.error:
+        lines.append("No goals")
     else:
         lines.append("No goals (proof complete)")
 

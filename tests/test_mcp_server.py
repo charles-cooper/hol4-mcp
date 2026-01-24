@@ -320,6 +320,49 @@ async def test_state_at_outside_theorem(tmp_path):
         await hol_stop(session="outside_test")
 
 
+async def test_state_at_qed_line(tmp_path):
+    """Test hol_state_at on QED line shows final state (proof complete)."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+
+    try:
+        await hol_file_init(file=str(test_file), session="qed_test")
+
+        # add_zero theorem: Proof at line 14, simp[] at line 14, QED at line 15
+        # Querying QED line should show final state with all tactics replayed
+        result = await hol_state_at(session="qed_test", line=15, col=1)
+
+        # Should show all tactics replayed
+        assert "Tactic" in result
+        # Should show proof complete (no goals)
+        assert "proof complete" in result.lower()
+        # Should NOT have error about position
+        assert "ERROR" not in result
+    finally:
+        await hol_stop(session="qed_test")
+
+
+async def test_state_at_after_qed_line(tmp_path):
+    """Test hol_state_at after QED line returns error."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+
+    try:
+        await hol_file_init(file=str(test_file), session="after_qed_test")
+
+        # add_zero theorem ends at QED on line 15
+        # Line 16 is blank, line 17 starts next theorem
+        # Querying line 16 should give an error (outside theorem bounds)
+        result = await hol_state_at(session="after_qed_test", line=16, col=1)
+
+        # Should have error about position not in theorem
+        assert "ERROR" in result or "not within any theorem" in result
+        # Should NOT say "proof complete" since this is an error case
+        assert "proof complete" not in result.lower() or "ERROR" in result
+    finally:
+        await hol_stop(session="after_qed_test")
+
+
 async def test_state_at_auto_init(tmp_path):
     """Test hol_state_at with file parameter auto-calls hol_file_init."""
     test_file = tmp_path / "testScript.sml"

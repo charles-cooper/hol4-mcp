@@ -584,10 +584,11 @@ class FileProofCursor:
                 self._active_tactics = make_tactic_spans(raw_spans, proof_start_offset, self._line_starts)
         timings['linearize'] = time.perf_counter() - t2
 
-        # Check if position is within theorem bounds
+        # Check if position is within theorem bounds (include QED line)
+        # proof_end_line is "line after QED", so QED is at proof_end_line - 1
         proof_keyword_line = thm.proof_start_line - 1
         qed_line = thm.proof_end_line - 1
-        if line < proof_keyword_line or line >= thm.proof_end_line:
+        if line < proof_keyword_line or line > qed_line:
             return StateAtResult(
                 goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
                 file_hash=self._content_hash,
@@ -596,11 +597,15 @@ class FileProofCursor:
             )
 
         # Find tactic index at position (state BEFORE tactic at position)
-        tactic_idx = 0
-        for i, tac in enumerate(self._active_tactics):
-            if (line, col) < tac.start:
-                break
-            tactic_idx = i + 1
+        # If on QED line, replay all tactics to show final state
+        if line == qed_line:
+            tactic_idx = len(self._active_tactics)
+        else:
+            tactic_idx = 0
+            for i, tac in enumerate(self._active_tactics):
+                if (line, col) < tac.start:
+                    break
+                tactic_idx = i + 1
 
         tactics_to_replay = min(tactic_idx, len(self._active_tactics))
         error_msg = None
