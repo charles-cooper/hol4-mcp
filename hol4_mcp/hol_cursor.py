@@ -74,7 +74,7 @@ async def get_script_dependencies(script_path: Path) -> list[str]:
 @dataclass
 class StateAtResult:
     """Result of state_at() call."""
-    goals: list[str]          # Current goals (may be empty if proof complete)
+    goals: list[dict]         # Current goals: [{"asms": [...], "goal": "..."}, ...]
     tactic_idx: int           # Index of tactic at position (0-based)
     tactics_replayed: int     # Number of tactics replayed to reach this state
     tactics_total: int        # Total tactics in proof
@@ -682,10 +682,11 @@ class FileProofCursor:
             timings=timings,
         )
 
-    def _parse_goals_json(self, output: str) -> list[str]:
+    def _parse_goals_json(self, output: str) -> list[dict]:
         """Parse JSON goal output from goals_json().
 
-        Output format: {"ok":["goal1", ...]} or {"err":"message"}
+        Output format: {"ok":[{"asms":[...], "goal":"..."}, ...]} or {"err":"message"}
+        Returns: List of goal dicts with 'asms' (list of assumption strings) and 'goal' (conclusion string)
         Raises: HOLParseError if HOL4 returned an error or output is malformed.
         """
         import json
@@ -696,7 +697,14 @@ class FileProofCursor:
             raise HOLParseError(f"Invalid JSON from goals_json: {e}") from e
 
         if 'ok' in result:
-            return result['ok']
+            goals = []
+            for g in result['ok']:
+                if isinstance(g, dict) and 'asms' in g and 'goal' in g:
+                    goals.append(g)
+                else:
+                    # Old format (just goal string) for backwards compat
+                    goals.append({"asms": [], "goal": str(g)})
+            return goals
         elif 'err' in result:
             raise HOLParseError(f"goals_json: {result['err']}")
         else:

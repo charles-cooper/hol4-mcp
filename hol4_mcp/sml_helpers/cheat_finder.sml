@@ -43,10 +43,19 @@ fun json_string_array strs =
 fun json_ok payload = "{\"ok\":" ^ payload ^ "}"
 fun json_err msg = "{\"err\":" ^ json_string msg ^ "}"
 
-(* Print current goals as JSON: {"ok":["goal1",...]} or {"err":"message"} *)
+(* Convert a single goal (assumptions, conclusion) to JSON object *)
+fun goal_to_json (asms, concl) =
+  "{\"asms\":" ^ json_string_array (map term_to_string asms) ^
+  ",\"goal\":" ^ json_string (term_to_string concl) ^ "}"
+
+(* Convert list of goals to JSON array *)
+fun goals_to_json_array goals =
+  "[" ^ String.concatWith "," (map goal_to_json goals) ^ "]"
+
+(* Print current goals as JSON: {"ok":[{"asms":[...],"goal":"..."},...]}} *)
 fun goals_json () = 
-  let val goals = map (term_to_string o snd) (top_goals())
-  in print (json_ok (json_string_array goals) ^ "\n") end
+  let val goals = top_goals()
+  in print (json_ok (goals_to_json_array goals) ^ "\n") end
   handle e => print (json_err (exnMessage e) ^ "\n");
 
 (* linearize_with_spans - Return list of (tactic, start, end) for navigation

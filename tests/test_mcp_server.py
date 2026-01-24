@@ -505,21 +505,25 @@ def test_parse_goals_json():
     # Empty goals
     assert cursor._parse_goals_json('{"ok":[]}\n') == []
 
-    # Single goal
-    assert cursor._parse_goals_json('{"ok":["A ⇒ A"]}\n') == ['A ⇒ A']
+    # New format with assumptions
+    result = cursor._parse_goals_json('{"ok":[{"asms":["P","Q"],"goal":"R"}]}\n')
+    assert result == [{"asms": ["P", "Q"], "goal": "R"}]
 
-    # Multiple goals
-    assert cursor._parse_goals_json('{"ok":["A", "B"]}\n') == ['A', 'B']
+    # Multiple goals with assumptions
+    result = cursor._parse_goals_json('{"ok":[{"asms":[],"goal":"A"},{"asms":["X"],"goal":"B"}]}\n')
+    assert result == [{"asms": [], "goal": "A"}, {"asms": ["X"], "goal": "B"}]
 
-    # Complex goal with symbols
-    assert cursor._parse_goals_json('{"ok":["B ⇒ A ∧ B"]}\n') == ['B ⇒ A ∧ B']
+    # Old format (just strings) for backwards compat
+    result = cursor._parse_goals_json('{"ok":["A ⇒ A"]}\n')
+    assert result == [{"asms": [], "goal": "A ⇒ A"}]
 
     # Error case - should raise exception
     with pytest.raises(HOLParseError, match="NO_PROOFS"):
         cursor._parse_goals_json('{"err":"NO_PROOFS"}\n')
 
     # With trailing val it = (): unit
-    assert cursor._parse_goals_json('{"ok":["goal"]}\nval it = (): unit\n') == ['goal']
+    result = cursor._parse_goals_json('{"ok":[{"asms":[],"goal":"goal"}]}\nval it = (): unit\n')
+    assert result == [{"asms": [], "goal": "goal"}]
 
     # Invalid JSON should raise exception
     with pytest.raises(HOLParseError):

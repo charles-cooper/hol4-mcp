@@ -631,8 +631,14 @@ async def hol_state_at(
         lines.append("=== Goals ===")
 
     if result.goals:
-        for g in result.goals:
-            lines.append(g)
+        for i, g in enumerate(result.goals):
+            if i > 0:
+                lines.append("")  # Blank line between goals
+            if g.get('asms'):
+                for asm in g['asms']:
+                    lines.append(f"  {asm}")
+                lines.append("  " + "-" * 40)
+            lines.append(f"  {g['goal']}")
     else:
         lines.append("No goals (proof complete)")
 
