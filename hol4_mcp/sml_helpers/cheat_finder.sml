@@ -154,11 +154,60 @@ fun linearize_with_spans source = let
         let
           (* First item: use_eall stays false (unless it's itself a >> chain) *)
           val first_spans = flatten_split_spans first
-          (* Rest items: force use_eall=true for all *)
-          val rest_spans = List.concat (List.map flatten_split_spans rest)
-          val rest_with_eall = List.map (fn (t,s,e,_) => (t,s,e,true)) rest_spans
+          (* Rest items: base spans get use_eall=true, but >- arm spans stay false *)
+          val rest_spans = List.concat (List.map flatten_rest_item rest)
         in
-          first_spans @ rest_with_eall
+          first_spans @ rest_spans
+        end
+
+  (* Flatten a rest item in >> chain: leaf base gets use_eall=true, >- arms stay false
+     For nested ThenLT like (b >- c) >- d, only b (the leaf base) gets use_eall=true,
+     while c and d (all arms at any nesting level) stay use_eall=false. *)
+  and flatten_rest_item node =
+        let
+          (* Extract leaf base and all arms from nested ThenLT structure *)
+          fun collect_thenlt (TacticParse.ThenLT (base, arms)) =
+                if is_subgoal_base base then
+                  (* by/suffices_by: return entire construct as leaf *)
+                  (SOME (TacticParse.ThenLT (base, arms)), [])
+                else
+                  let val (leaf, inner_arms) = collect_thenlt base
+                  in (leaf, inner_arms @ arms) end
+            | collect_thenlt (TacticParse.LThen (base, arms)) =
+                let val (leaf, inner_arms) = collect_thenlt base
+                in (leaf, inner_arms @ arms) end
+            | collect_thenlt (TacticParse.Group (_, _, inner)) =
+                if is_split_node inner then collect_thenlt inner
+                else (SOME node, [])
+            | collect_thenlt other = (SOME other, [])
+        in
+          case collect_thenlt node of
+            (NONE, _) => []
+          | (SOME leaf, []) =>
+              (* No arms - just a simple node, force use_eall=true *)
+              List.map (fn (t,s,e,_) => (t,s,e,true)) (flatten_split_spans leaf)
+          | (SOME (TacticParse.ThenLT (base, arms)), all_arms) =>
+              if is_subgoal_base base then
+                (* by/suffices_by as leaf: atomic with use_eall=true, plus outer arms *)
+                let
+                  val (_, base_s, _) = node_text_span base
+                  fun last_span [] = (0, 0)
+                    | last_span [x] = node_span x
+                    | last_span (_::xs) = last_span xs
+                  val (_, arm_e) = last_span arms
+                  val t = text_at (base_s, arm_e)
+                  val by_span = if t = "" then [] else [(t, base_s, arm_e, true)]
+                  val outer_arm_spans = List.concat (List.map flatten_arm_spans all_arms)
+                in by_span @ outer_arm_spans end
+              else
+                (* Should not happen - collect_thenlt recurses through non-subgoal ThenLT *)
+                []
+          | (SOME leaf, all_arms) =>
+              (* Leaf base gets use_eall=true, all arms stay use_eall=false *)
+              let
+                val leaf_spans = List.map (fn (t,s,e,_) => (t,s,e,true)) (flatten_split_spans leaf)
+                val arm_spans = List.concat (List.map flatten_arm_spans all_arms)
+              in leaf_spans @ arm_spans end
         end
 
   (* Flatten a >- arm: each arm starts fresh (use_eall=false for first item) *)

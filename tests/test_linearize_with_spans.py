@@ -395,6 +395,34 @@ class TestUseEallFlag:
         # First should be a
         assert result[0][3] is False
 
+    async def test_thenl_after_then(self, hol_session):
+        """>- structure after >>: base gets use_eall=true, arms stay false.
+
+        Regression test for Bug 2: flatten_then_chain was forcing use_eall=true
+        on ALL spans from rest items, including >- arm spans which should stay false.
+        """
+        result = await call_linearize(hol_session, "a >> (b >- c >- d)")
+        # Expected:
+        # a: use_eall=False (first in >> chain)
+        # b: use_eall=True (base of >- structure, after >>)
+        # c: use_eall=False (>- arm)
+        # d: use_eall=False (>- arm)
+        assert len(result) == 4
+        texts = [r[0] for r in result]
+        ealls = [r[3] for r in result]
+
+        assert "a" in texts[0]
+        assert ealls[0] is False, "First item in >> chain should have use_eall=False"
+
+        assert "b" in texts[1]
+        assert ealls[1] is True, "Base of >- after >> should have use_eall=True"
+
+        assert "c" in texts[2]
+        assert ealls[2] is False, ">- arm should have use_eall=False"
+
+        assert "d" in texts[3]
+        assert ealls[3] is False, ">- arm should have use_eall=False"
+
     async def test_complex_chain(self, hol_session):
         """Complex pattern: a >> b >- (c >> d) >- e."""
         result = await call_linearize(hol_session, "a >> b >- (c >> d) >- e")
