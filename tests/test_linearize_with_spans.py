@@ -147,6 +147,62 @@ class TestLinearizeThenInThenLT:
         assert any("bar" in t for t in texts)
 
 
+class TestLinearizeWrapperPreservation:
+    """Tests for preserving tactic wrappers like rpt, TRY, REPEAT.
+    
+    Regression tests for bug where `rpt strip_tac >> sg `foo` >- simp[]`
+    would lose the `rpt` prefix, returning ('strip_tac', 4, 13) instead
+    of ('rpt strip_tac', 0, 13).
+    """
+
+    async def test_rpt_preserved_simple(self, hol_session):
+        """rpt should be preserved in simple case."""
+        result = await call_linearize(hol_session, "rpt strip_tac")
+        assert len(result) == 1
+        assert result[0][0] == "rpt strip_tac"
+        assert result[0][1] == 0  # Should start at offset 0
+
+    async def test_rpt_preserved_in_chain(self, hol_session):
+        """rpt should be preserved in >> chain."""
+        result = await call_linearize(hol_session, "rpt strip_tac >> simp[]")
+        assert len(result) == 2
+        assert result[0][0] == "rpt strip_tac"
+        assert result[0][1] == 0
+
+    async def test_rpt_preserved_with_sg_split(self, hol_session):
+        """rpt should be preserved when followed by sg >- (the original bug).
+        
+        This was the exact pattern that failed: when a >> chain containing
+        rpt is followed by sg `...` >-, the rpt wrapper was being stripped.
+        """
+        result = await call_linearize(hol_session, "rpt strip_tac >> sg `foo` >- simp[]")
+        assert len(result) >= 2
+        # First tactic should be the full rpt strip_tac, not just strip_tac
+        assert result[0][0] == "rpt strip_tac"
+        assert result[0][1] == 0  # Must start at offset 0, not 4
+
+    async def test_try_preserved(self, hol_session):
+        """TRY should be preserved."""
+        result = await call_linearize(hol_session, "TRY simp[] >> fs[]")
+        assert len(result) == 2
+        assert result[0][0] == "TRY simp[]"
+        assert result[0][1] == 0
+
+    async def test_repeat_preserved(self, hol_session):
+        """REPEAT should be preserved."""
+        result = await call_linearize(hol_session, "REPEAT strip_tac >> simp[]")
+        assert len(result) == 2
+        assert result[0][0] == "REPEAT strip_tac"
+        assert result[0][1] == 0
+
+    async def test_nested_wrappers_preserved(self, hol_session):
+        """Nested wrappers like TRY (rpt ...) should be preserved."""
+        result = await call_linearize(hol_session, "TRY (rpt strip_tac) >> simp[]")
+        assert len(result) == 2
+        assert result[0][0] == "TRY (rpt strip_tac)"
+        assert result[0][1] == 0
+
+
 class TestLinearizeSpans:
     """Tests for span (start, end) positions."""
 
