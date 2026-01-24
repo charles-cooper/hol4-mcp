@@ -102,7 +102,8 @@ class FileProofCursor:
     """
 
     def __init__(self, source_file: Path, session: HOLSession, *,
-                 checkpoint_dir: Path | None = None, mode: str = "g"):
+                 checkpoint_dir: Path | None = None, mode: str = "g",
+                 tactic_timeout: float = 5.0):
         """Initialize file proof cursor.
 
         Args:
@@ -112,6 +113,7 @@ class FileProofCursor:
             mode: "g" for goalstack (default) or "gt" for goaltree
                   - goalstack: uses g/e(tactic)/b, no proof extraction
                   - goaltree: uses gt/etq "tactic"/backup, p() extracts proof script
+            tactic_timeout: Max seconds per tactic (default 5.0, None=unlimited)
         """
         self.file = source_file
         self.session = session
@@ -120,6 +122,9 @@ class FileProofCursor:
         if mode not in ("g", "gt"):
             raise ValueError(f"mode must be 'g' or 'gt', got '{mode}'")
         self._mode = mode
+        
+        # Tactic timeout for build discipline
+        self._tactic_timeout = tactic_timeout
 
         # Checkpoint directory: .hol/cursor_checkpoints/ (alongside holmake artifacts)
         if checkpoint_dir is None:
@@ -576,7 +581,9 @@ class FileProofCursor:
                     else:
                         tactic_cmds = [f'etq "{escape_sml_string(t.text)}"' for t in tactics_to_apply]
                     batch = "; ".join(tactic_cmds) + ";"
-                    result = await self.session.send(batch, timeout=300)
+                    # Batch timeout = per-tactic timeout * num tactics (min 30s)
+                    batch_timeout = max(30, int(self._tactic_timeout * len(tactics_to_apply))) if self._tactic_timeout else 300
+                    result = await self.session.send(batch, timeout=batch_timeout)
                     if _is_hol_error(result):
                         error_msg = f"Tactic replay failed (batch of {len(tactics_to_apply)}): {result[:200]}"
                         # Don't know exact failure point in batch - reset to start
@@ -621,22 +628,29 @@ class FileProofCursor:
                 else:
                     tactic_cmds = [f'etq "{escape_sml_string(t.text)}"' for t in self._active_tactics]
                 batch = "; ".join(tactic_cmds) + ";"
-                result = await self.session.send(batch, timeout=300)
+                # Batch timeout = per-tactic timeout * num tactics (min 30s)
+                batch_timeout = max(30, int(self._tactic_timeout * total_tactics)) if self._tactic_timeout else 300
+                result = await self.session.send(batch, timeout=batch_timeout)
                 if _is_hol_error(result):
                     # Fallback: replay individually up to requested position
                     # Only report error if it's at or before the requested position
                     await self.session.send('drop_all();', timeout=5)
                     await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
                     actual_replayed = 0
+                    # Per-tactic timeout (default 5s)
+                    tac_timeout = int(self._tactic_timeout) if self._tactic_timeout else 300
                     # Only replay up to tactics_to_replay, not all tactics
                     for i, tac in enumerate(self._active_tactics[:tactics_to_replay]):
                         if self._mode == "g":
-                            result = await self.session.send(f'e({tac.text});', timeout=300)
+                            result = await self.session.send(f'e({tac.text});', timeout=tac_timeout)
                         else:
                             tac_escaped = escape_sml_string(tac.text)
-                            result = await self.session.send(f'etq "{tac_escaped}";', timeout=300)
+                            result = await self.session.send(f'etq "{tac_escaped}";', timeout=tac_timeout)
                         if _is_hol_error(result):
-                            error_msg = f"Tactic {i+1} failed: {tac.text[:50]}"
+                            if result.startswith("TIMEOUT"):
+                                error_msg = f"Tactic {i+1} timed out (>{tac_timeout}s): {tac.text[:50]}"
+                            else:
+                                error_msg = f"Tactic {i+1} failed: {tac.text[:50]}"
                             self._current_tactic_idx = i
                             actual_replayed = i
                             break
