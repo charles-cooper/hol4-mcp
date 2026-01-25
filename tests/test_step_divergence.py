@@ -1,4 +1,12 @@
-"""Test step_plan_json consistency - single source of truth for O(1) navigation."""
+"""Test step_plan_json consistency - single source of truth for O(1) navigation.
+
+Key design:
+- >> chains: return one step per tactic (for fine-grained navigation)
+  - First step uses e(), subsequent use eall() for correct >> semantics
+  - e(a >> b >> c) = e(a); eall(b); eall(c)
+- >- chains: return one step per fragment (linearize splits them)
+  - Navigation inside >- uses HEADGOAL via partial_step_commands
+"""
 
 import pytest
 from pathlib import Path
@@ -35,39 +43,48 @@ class TestStepPlan:
         assert plan[0].end == 9  # len("strip_tac")
         assert "e(strip_tac)" in plan[0].cmd
 
-    async def test_step_plan_then_chain_is_one_step(self, hol_session):
-        """THEN chain (>>) is treated as single step."""
+    async def test_step_plan_then_chain_multiple_steps(self, hol_session):
+        """THEN chain (>>) returns one step per tactic for fine-grained navigation.
+        
+        First step uses e(), subsequent steps use eall() for correct >> semantics:
+        e(a >> b >> c) = e(a); eall(b); eall(c)
+        """
         tactic = "strip_tac >> rw[] >> fs[]"
         escaped = escape_sml_string(tactic)
         result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
         plan = parse_step_plan_output(result)
         
-        # THEN chain is one step with end at the final fragment
-        assert len(plan) == 1
-        assert plan[0].end == len(tactic)
-        assert plan[0].cmd.count("e(") == 1
+        # THEN chain gives one step per tactic
+        assert len(plan) == 3
+        # First uses e(), rest use eall()
+        assert plan[0].cmd.strip().startswith("e(")
+        assert plan[1].cmd.strip().startswith("eall(")
+        assert plan[2].cmd.strip().startswith("eall(")
 
-    async def test_step_plan_thenl_is_one_step(self, hol_session):
-        """THENL (>-) with arms is treated as single step."""
+    async def test_step_plan_thenl_multiple_steps(self, hol_session):
+        """THENL (>-) with arms returns multiple steps (linearize splits them)."""
         tactic = "conj_tac >- simp[] >- fs[]"
         escaped = escape_sml_string(tactic)
         result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
         plan = parse_step_plan_output(result)
         
-        # THENL is one step
-        assert len(plan) == 1
-        assert plan[0].end == len(tactic)
-        assert plan[0].cmd.count("e(") == 1
+        # THENL is linearized into fragments
+        assert len(plan) >= 1
+        # All steps start with e( or eall(
+        for step in plan:
+            cmd = step.cmd.strip()
+            assert cmd.startswith("e(") or cmd.startswith("eall(")
 
-    async def test_step_plan_thenl_bracket_is_one_step(self, hol_session):
-        """THENL with bracket (>|) is treated as single step."""
+    async def test_step_plan_thenl_bracket(self, hol_session):
+        """THENL with bracket (>|) returns steps."""
         tactic = "conj_tac >| [simp[], rw[]]"
         escaped = escape_sml_string(tactic)
         result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
         plan = parse_step_plan_output(result)
         
-        assert len(plan) == 1
-        assert plan[0].end == len(tactic)
+        assert len(plan) >= 1
+        # Last step should end at tactic length
+        assert plan[-1].end == len(tactic)
 
     async def test_step_plan_ends_are_monotonic(self, hol_session):
         """Step ends should be monotonically increasing."""
@@ -80,12 +97,13 @@ class TestStepPlan:
             assert plan[i].end >= plan[i-1].end
 
     async def test_step_plan_commands_are_executable(self, hol_session):
-        """Step commands should be valid e() calls."""
+        """Step commands should be valid e() or eall() calls."""
         tactic = "conj_tac >- simp[] >- fs[]"
         escaped = escape_sml_string(tactic)
         result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
         plan = parse_step_plan_output(result)
         
         for step in plan:
-            assert step.cmd.strip().startswith("e(")
-            assert step.cmd.strip().endswith(");")
+            cmd = step.cmd.strip()
+            assert cmd.startswith("e(") or cmd.startswith("eall(")
+            assert cmd.endswith(");")

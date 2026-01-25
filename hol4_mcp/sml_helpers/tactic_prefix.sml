@@ -83,8 +83,39 @@ fun tactic_steps proofBody =
     (* Linearize the entire proof to get all fragments *)
     val allFrags = TacticParse.linearize isAtom tree
 
+    (* Compute span bounds from nested Opaque nodes for composite structures *)
+    fun computeSpan e =
+      let
+        fun go (TacticParse.Opaque (_, (l, r))) (minL, maxR) = (Int.min(l, minL), Int.max(r, maxR))
+          | go (TacticParse.Then ls) acc = foldl (fn (x, a) => go x a) acc ls
+          | go (TacticParse.ThenLT (e, ls)) acc = foldl (fn (x, a) => go x a) (go e acc) ls
+          | go (TacticParse.First ls) acc = foldl (fn (x, a) => go x a) acc ls
+          | go (TacticParse.Try e) acc = go e acc
+          | go (TacticParse.Repeat e) acc = go e acc
+          | go (TacticParse.Group (_, _, e)) acc = go e acc
+          | go (TacticParse.RepairGroup (_, _, e, _)) acc = go e acc
+          | go (TacticParse.LThenLT ls) acc = foldl (fn (x, a) => go x a) acc ls
+          | go (TacticParse.LThen (e, ls)) acc = foldl (fn (x, a) => go x a) (go e acc) ls
+          | go (TacticParse.LThen1 e) acc = go e acc
+          | go (TacticParse.LAllGoals e) acc = go e acc
+          | go (TacticParse.LNthGoal (e, _)) acc = go e acc
+          | go (TacticParse.LLastGoal e) acc = go e acc
+          | go (TacticParse.LHeadGoal e) acc = go e acc
+          | go (TacticParse.LNullOk e) acc = go e acc
+          | go (TacticParse.LTry e) acc = go e acc
+          | go (TacticParse.LRepeat e) acc = go e acc
+          | go (TacticParse.LFirstLT e) acc = go e acc
+          | go _ acc = acc
+        val (minL, maxR) = go e (String.size proofBody, 0)
+      in
+        if maxR > 0 then SOME (minL, maxR) else NONE
+      end
+
     (* Extract spans from fragments to find step boundaries *)
-    fun fragSpan (TacticParse.FAtom a) = TacticParse.topSpan a
+    fun fragSpan (TacticParse.FAtom a) = 
+          (case TacticParse.topSpan a of
+             SOME sp => SOME sp
+           | NONE => computeSpan a)
       | fragSpan (TacticParse.FGroup (p, _)) = SOME p
       | fragSpan _ = NONE
 
@@ -191,43 +222,243 @@ fun partial_step_commands_json proofBody startOffset endOffset =
   handle e => print (json_err (exnMessage e) ^ "\n");
 
 (* step_plan: Get step boundaries aligned with executable commands.
-   Returns (end_offset, command) pairs where each command is one e() call.
-   This is the single source of truth for O(1) tactic navigation. *)
+   Returns (end_offset, command) pairs for O(1) tactic navigation.
+   
+   Design:
+   - >> chains: decompose into individual e()/eall() commands (multiple backup points)
+   - >- chains: treat as ATOMIC (one backup point, no internal navigation)
+   
+   This is correct because:
+   - >> is sequential: each tactic runs on results of previous, intermediate states exist
+   - >- is parallel routing: branches are concurrent, not sequential steps
+   
+   Implementation note:
+   For `a >> b >> c >- d >- e` (AST: ThenLT(ThenLT(Then([a,b,c]), [d]), [e])):
+   - We extract the base Then([a,b,c]) and linearize THAT
+   - The >- suffix becomes ONE final step: eall(ALL_TAC >- d >- e)
+   This avoids the problem where making ThenLT atomic makes everything one step. *)
+
+(* Compute overall span of a tac_expr by finding min/max from nested Opaque nodes.
+   Returns NONE if no spans found (shouldn't happen for valid parsed tactics). *)
+fun computeSpan e =
+  let
+    fun merge NONE s = s
+      | merge s NONE = s
+      | merge (SOME (l1, r1)) (SOME (l2, r2)) = SOME (Int.min(l1, l2), Int.max(r1, r2))
+    
+    fun go (TacticParse.Opaque (_, sp)) = SOME sp
+      | go (TacticParse.LOpaque (_, sp)) = SOME sp
+      | go (TacticParse.OOpaque (_, sp)) = SOME sp
+      | go (TacticParse.LSelectGoal sp) = SOME sp
+      | go (TacticParse.LSelectGoals sp) = SOME sp
+      | go (TacticParse.List (sp, es)) = foldl (fn (e, acc) => merge (go e) acc) (SOME sp) es
+      | go (TacticParse.Group (_, sp, e)) = merge (SOME sp) (go e)
+      | go (TacticParse.RepairEmpty (_, sp, _)) = SOME sp
+      | go (TacticParse.RepairGroup (sp, _, e, _)) = merge (SOME sp) (go e)
+      | go (TacticParse.Then es) = foldl (fn (e, acc) => merge (go e) acc) NONE es
+      | go (TacticParse.ThenLT (e, es)) = foldl (fn (e, acc) => merge (go e) acc) (go e) es
+      | go (TacticParse.LThenLT es) = foldl (fn (e, acc) => merge (go e) acc) NONE es
+      | go (TacticParse.First es) = foldl (fn (e, acc) => merge (go e) acc) NONE es
+      | go (TacticParse.LFirst es) = foldl (fn (e, acc) => merge (go e) acc) NONE es
+      | go (TacticParse.Try e) = go e
+      | go (TacticParse.LTry e) = go e
+      | go (TacticParse.Repeat e) = go e
+      | go (TacticParse.LRepeat e) = go e
+      | go (TacticParse.MapEvery (sp, es)) = foldl (fn (e, acc) => merge (go e) acc) (SOME sp) es
+      | go (TacticParse.MapFirst (sp, es)) = foldl (fn (e, acc) => merge (go e) acc) (SOME sp) es
+      | go (TacticParse.Rename sp) = SOME sp
+      | go (TacticParse.Subgoal sp) = SOME sp
+      | go (TacticParse.LThen (e, es)) = foldl (fn (e, acc) => merge (go e) acc) (go e) es
+      | go (TacticParse.LThen1 e) = go e
+      | go (TacticParse.LTacsToLT e) = go e
+      | go (TacticParse.LNullOk e) = go e
+      | go (TacticParse.LFirstLT e) = go e
+      | go (TacticParse.LAllGoals e) = go e
+      | go (TacticParse.LNthGoal (e, sp)) = merge (go e) (SOME sp)
+      | go (TacticParse.LLastGoal e) = go e
+      | go (TacticParse.LHeadGoal e) = go e
+      | go (TacticParse.LSplit (sp, e1, e2)) = merge (SOME sp) (merge (go e1) (go e2))
+      | go TacticParse.LReverse = NONE
+      | go (TacticParse.LSelectThen (e1, e2)) = merge (go e1) (go e2)
+  in
+    go e
+  end
+
+(* Extract the innermost base from nested ThenLT structures.
+   For ThenLT(ThenLT(Then([a,b,c]), [d]), [e]) returns Then([a,b,c]).
+   Also returns the position just before the first arm (to find >- suffix). *)
+fun extractThenLTBaseAndFirstArm (TacticParse.ThenLT (e, arms)) = 
+      let 
+        val (base, _) = extractThenLTBaseAndFirstArm e
+        (* Find the start of the first arm at this level *)
+        val armStart = case arms of
+            [] => NONE
+          | (firstArm::_) => 
+              case computeSpan firstArm of
+                SOME (start, _) => SOME start
+              | NONE => NONE
+      in
+        (base, armStart)
+      end
+  | extractThenLTBaseAndFirstArm (TacticParse.Group (_, _, e)) = extractThenLTBaseAndFirstArm e
+  | extractThenLTBaseAndFirstArm e = (e, NONE)
+
+(* Simple base extraction for backward compatibility *)
+fun extractThenLTBase e = #1 (extractThenLTBaseAndFirstArm e)
+
+(* Find the start of the first >- arm in a ThenLT chain.
+   Scans back to find the >- operator position. *)
+fun findFirstArmStart (TacticParse.ThenLT (e, arms)) =
+      let
+        val innerArmStart = findFirstArmStart e
+      in
+        case innerArmStart of
+          SOME _ => innerArmStart  (* Inner ThenLT has first arm *)
+        | NONE => 
+            (* This is the innermost ThenLT, get arm start from here *)
+            case arms of
+              [] => NONE
+            | (firstArm::_) => 
+                case computeSpan firstArm of
+                  SOME (start, _) => SOME start
+                | NONE => NONE
+      end
+  | findFirstArmStart (TacticParse.Group (_, _, e)) = findFirstArmStart e
+  | findFirstArmStart _ = NONE
+
+(* Find the position of ThenLT operator before a given position in the text.
+   Handles: >- >| >>> >~ >>~ >>~- THEN1 THENL THEN_LT *)
+fun findThenLTOperator proofBody armStart =
+  let
+    val len = String.size proofBody
+    fun charAt i = if i >= 0 andalso i < len then String.sub(proofBody, i) else #" "
+    
+    (* Check for 2-char operators: >- >| >~ *)
+    fun is2CharOp pos =
+      let val c1 = charAt pos val c2 = charAt (pos + 1)
+      in c1 = #">" andalso (c2 = #"-" orelse c2 = #"|" orelse c2 = #"~")
+      end
+    
+    (* Check for 3-char operators: >>> >>~ *)
+    fun is3CharOp pos =
+      let val c1 = charAt pos val c2 = charAt (pos + 1) val c3 = charAt (pos + 2)
+      in c1 = #">" andalso c2 = #">" andalso (c3 = #">" orelse c3 = #"~")
+      end
+    
+    (* Check for 4-char operator: >>~- *)
+    fun is4CharOp pos =
+      let val c1 = charAt pos val c2 = charAt (pos + 1) 
+          val c3 = charAt (pos + 2) val c4 = charAt (pos + 3)
+      in c1 = #">" andalso c2 = #">" andalso c3 = #"~" andalso c4 = #"-"
+      end
+    
+    fun scanBack pos =
+      if pos < 2 then 0
+      else if is4CharOp (pos - 4) then pos - 4
+      else if is3CharOp (pos - 3) then pos - 3
+      else if is2CharOp (pos - 2) then pos - 2
+      else scanBack (pos - 1)
+  in
+    scanBack armStart
+  end
+
+(* Check if an expression has ThenLT at top level (unwrapping Groups) *)
+fun hasThenLTAtTop (TacticParse.ThenLT _) = true
+  | hasThenLTAtTop (TacticParse.Group (_, _, e)) = hasThenLTAtTop e
+  | hasThenLTAtTop _ = false
+
 fun step_plan proofBody =
   let
     val tree = TacticParse.parseTacticBlock proofBody
     val defaultSpan = (0, String.size proofBody)
+    val fullEnd = String.size proofBody
 
-    (* Use linearize to get individual fragments - same pattern as tactic_steps *)
+    (* Standard isAtom for Then chains - NO special ThenLT handling *)
     fun isAtom e = Option.isSome (TacticParse.topSpan e)
-    val allFrags = TacticParse.linearize isAtom tree
 
-    (* Extract spans from fragments to find step boundaries *)
-    fun fragSpan (TacticParse.FAtom a) = TacticParse.topSpan a
+    (* Convert e() to eall() for subsequent steps *)
+    fun eToEall cmd =
+      if String.isPrefix "e(" cmd then
+        "eall(" ^ String.extract(cmd, 2, NONE)
+      else cmd
+
+    (* Extract spans from fragments *)
+    fun fragSpan (TacticParse.FAtom a) = 
+          (case TacticParse.topSpan a of
+             SOME sp => SOME sp
+           | NONE => computeSpan a)
       | fragSpan (TacticParse.FGroup (p, _)) = SOME p
       | fragSpan _ = NONE
 
-    (* Collect end positions of each step *)
+    (* Collect end positions from fragments *)
     fun collectEnds [] acc = rev acc
       | collectEnds (f::fs) acc =
           case fragSpan f of
             SOME (_, endPos) => collectEnds fs (endPos :: acc)
           | NONE => collectEnds fs acc
-    val endPositions = collectEnds allFrags []
 
-    (* For each end position, generate the cumulative e() command *)
-    fun makeStep endPos =
-      let
-        val frags = TacticParse.sliceTacticBlock 0 endPos false defaultSpan tree
-        val cmd = TacticParse.printFragsAsE proofBody frags
-      in
-        (endPos, cmd)
-      end
+    (* Generate steps from fragments and end positions *)
+    fun makeSteps baseTree [] _ _ acc = rev acc
+      | makeSteps baseTree (endPos::rest) prevEnd isFirst acc =
+          let
+            val frags = TacticParse.sliceTacticBlock prevEnd endPos false defaultSpan baseTree
+            val rawCmd = TacticParse.printFragsAsE proofBody frags
+            val cmd = if isFirst then rawCmd else eToEall rawCmd
+            val step = if String.size cmd > 0 then [(endPos, cmd)] else []
+          in
+            makeSteps baseTree rest endPos false (step @ acc)
+          end
 
-    val steps = map makeStep endPositions
-    val nonEmpty = List.filter (fn (_, cmd) => String.size cmd > 0) steps
   in
-    nonEmpty
+    if hasThenLTAtTop tree then
+      (* Special handling for top-level ThenLT:
+         1. Extract base Then chain
+         2. Linearize and step through base
+         3. Add ONE final step for the >- suffix *)
+      let
+        val base = extractThenLTBase tree
+        val baseFrags = TacticParse.linearize isAtom base
+        val baseEndPositions = collectEnds baseFrags []
+        
+        (* Steps for the base Then chain *)
+        val baseSteps = makeSteps base baseEndPositions 0 true []
+        
+        (* Find where the first >- operator starts in the text.
+           We scan back from the first arm's position to find ">-". *)
+        val firstArmStartOpt = findFirstArmStart tree
+        
+        (* Final step: the entire >- suffix as one atomic operation *)
+        val thenLTStep = case firstArmStartOpt of
+            SOME armStart =>
+              let
+                (* Find ">-" operator position by scanning back from arm *)
+                val opStart = findThenLTOperator proofBody armStart
+                (* Extract ">- d >- e" suffix from original text *)
+                val suffix = String.substring(proofBody, opStart, fullEnd - opStart)
+                (* Build: eall(ALL_TAC >- d >- e); *)
+                val cmd = "eall(ALL_TAC " ^ suffix ^ ");\n"
+              in
+                [(fullEnd, cmd)]
+              end
+          | NONE => 
+              (* Fallback: treat whole thing as one step *)
+              let
+                val frags = TacticParse.sliceTacticBlock 0 fullEnd false defaultSpan tree
+                val cmd = TacticParse.printFragsAsE proofBody frags
+              in
+                [(fullEnd, cmd)]
+              end
+      in
+        baseSteps @ thenLTStep
+      end
+    else
+      (* No ThenLT at top: normal linearization *)
+      let
+        val allFrags = TacticParse.linearize isAtom tree
+        val endPositions = collectEnds allFrags []
+      in
+        makeSteps tree endPositions 0 true []
+      end
   end
 
 fun step_plan_json proofBody =

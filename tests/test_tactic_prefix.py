@@ -476,16 +476,22 @@ class TestStepPlan:
         # End positions should be monotonically increasing
         ends = [step.end for step in result]
         assert ends == sorted(ends)
-        # Each cmd should be cumulative e() command
+        # Each cmd should be INDIVIDUAL (not cumulative)
         assert "simp" in result[0].cmd
-        assert "simp" in result[1].cmd and "strip_tac" in result[1].cmd
+        assert "strip_tac" in result[1].cmd
         assert "gvs" in result[2].cmd
 
     async def test_thenlt_chain(self, hol_session):
-        """>- should return steps for head and each arm."""
+        """>- decomposes into head + atomic arms.
+        
+        For `Induct >- simp[]`:
+        - Step 1: e(Induct) - the head
+        - Step 2: eall(ALL_TAC >- simp[]) - arms as atomic suffix
+        """
         result = await call_step_plan(hol_session, "Induct >- simp[]")
         assert len(result) == 2
         assert "Induct" in result[0].cmd
+        assert ">-" in result[1].cmd
         assert "simp" in result[1].cmd
 
     async def test_mixed_then_and_thenlt(self, hol_session):
@@ -532,18 +538,77 @@ class TestStepPlan:
         assert plan_ends == steps_ends
 
     async def test_by_construct(self, hol_session):
-        """`by` should be atomic."""
+        """`by` is parsed as ThenLT, so decomposes into head + atomic arms."""
         result = await call_step_plan(hol_session, "`P` by simp[]")
-        assert len(result) == 1
+        # `by` = ThenLT(Subgoal, [arm]) so we get head + arms
+        assert len(result) == 2
 
     async def test_by_in_chain(self, hol_session):
         """`by` in >> chain should be one step."""
         result = await call_step_plan(hol_session, "rpt strip_tac >> `P` by simp[] >> fs[]")
         assert len(result) == 3
 
-    async def test_commands_are_valid_e_calls(self, hol_session):
-        """Each cmd should be a valid e() command."""
+    async def test_commands_are_valid_e_or_eall_calls(self, hol_session):
+        """Each cmd should be a valid e() or eall() command."""
         result = await call_step_plan(hol_session, "a >> b >> c")
-        for step in result:
-            assert step.cmd.strip().startswith("e(")
-            assert step.cmd.strip().endswith(");") or step.cmd.strip().endswith(";\n")
+        for i, step in enumerate(result):
+            cmd = step.cmd.strip()
+            if i == 0:
+                assert cmd.startswith("e("), f"First step should use e(), got: {cmd}"
+            else:
+                assert cmd.startswith("eall("), f"Step {i} should use eall(), got: {cmd}"
+            assert cmd.endswith(");") or cmd.endswith(";\n")
+
+    async def test_commands_are_individual_not_cumulative(self, hol_session):
+        """Each step.cmd should be INDIVIDUAL, not cumulative.
+        
+        Critical for cursor: it joins all commands with "".join(step.cmd for step in steps).
+        If commands are cumulative (e(a), e(a>>b), e(a>>b>>c)), joining runs 'a' 3 times!
+        Commands should be individual: e(a), eall(b), eall(c).
+        First uses e(), subsequent use eall() for correct >> semantics.
+        """
+        result = await call_step_plan(hol_session, "simp[] >> gvs[] >> fs[]")
+        assert len(result) == 3
+        
+        # Each command should contain only ONE tactic (individual steps)
+        # Step 1: e(simp[])
+        assert "simp" in result[0].cmd
+        assert result[0].cmd.strip().startswith("e(")
+        assert "gvs" not in result[0].cmd
+        assert "fs" not in result[0].cmd
+        
+        # Step 2: eall(gvs[]) - uses eall for >> semantics
+        assert "gvs" in result[1].cmd
+        assert result[1].cmd.strip().startswith("eall(")
+        assert "simp" not in result[1].cmd
+        assert "fs" not in result[1].cmd
+        
+        # Step 3: eall(fs[])
+        assert "fs" in result[2].cmd
+        assert result[2].cmd.strip().startswith("eall(")
+        assert "simp" not in result[2].cmd
+        assert "gvs" not in result[2].cmd
+
+    async def test_joined_commands_execute_each_tactic_once(self, hol_session):
+        """Joining all step commands should execute each tactic exactly once.
+        
+        This is how the cursor uses step_plan:
+            step_cmds = "".join(step.cmd for step in self._step_plan)
+        
+        If step_plan returns cumulative commands, tactics get executed multiple times.
+        First step uses e(), subsequent use eall() for correct >> semantics.
+        """
+        # Use simp[] instead of all_tac - all_tac has no span in TacticParse
+        result = await call_step_plan(hol_session, "conj_tac >> conj_tac >> simp[]")
+        
+        # Join commands like the cursor does
+        joined = "".join(step.cmd for step in result)
+        
+        # Should have 1 e() and 2 eall() calls
+        assert joined.count("e(") == 1, f"Expected 1 e() call. Commands:\n{joined}"
+        assert joined.count("eall(") == 2, f"Expected 2 eall() calls. Commands:\n{joined}"
+        
+        # Each tactic should appear exactly once in the joined string
+        # (conj_tac appears twice in the original, so 2 occurrences is correct)
+        assert joined.count("conj_tac") == 2, f"conj_tac should appear twice"
+        assert joined.count("simp") == 1, f"simp should appear once"
