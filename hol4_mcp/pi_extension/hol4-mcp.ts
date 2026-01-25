@@ -11,6 +11,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
+import { Text } from "@mariozechner/pi-tui";
 
 // Minimal MCP client - JSON-RPC 2.0 over stdio with NDJSON framing (FastMCP style)
 class McpClient {
@@ -221,7 +222,7 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
 
           return {
             content: [{ type: "text", text: textContent || "(no output)" }],
-            details: { mcpResult: result },
+            details: { mcpResult: result, tool_name: params.tool_name, args },
             isError: result.isError === true,
           };
         }
@@ -231,6 +232,56 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
         const message = err instanceof Error ? err.message : String(err);
         return { content: [{ type: "text", text: `HOL4 MCP error: ${message}` }], details: {}, isError: true };
       }
+    },
+
+    renderCall(args, theme) {
+      if (args.action === "list") {
+        return new Text(theme.fg("toolTitle", theme.bold("hol4 ")) + theme.fg("accent", "list"), 0, 0);
+      }
+      
+      const toolName = args.tool_name || "?";
+      let text = theme.fg("toolTitle", theme.bold("hol4 ")) + theme.fg("accent", toolName);
+      
+      // Parse args if string (LLM sometimes sends JSON string)
+      let toolArgs = args.args;
+      if (typeof toolArgs === "string") {
+        try { toolArgs = JSON.parse(toolArgs); } catch { toolArgs = null; }
+      }
+      
+      if (toolArgs && typeof toolArgs === "object") {
+        const argParts: string[] = [];
+        for (const [k, v] of Object.entries(toolArgs)) {
+          const val = typeof v === "string" ? v : JSON.stringify(v);
+          argParts.push(`${k}=${val}`);
+        }
+        if (argParts.length > 0) {
+          text += "\n" + theme.fg("dim", "  " + argParts.join(", "));
+        }
+      }
+      
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, { expanded }, theme) {
+      const details = result.details as { tool_name?: string; args?: any; mcpResult?: any } | undefined;
+      const text = result.content[0];
+      const output = text?.type === "text" ? text.text : "(no output)";
+      const isError = result.isError === true;
+      const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+      
+      if (expanded) {
+        return new Text(`${icon} ${output}`, 0, 0);
+      }
+      
+      // Collapsed: show first few lines
+      const lines = output.split("\n");
+      const preview = lines.slice(0, 5).join("\n");
+      const truncated = lines.length > 5;
+      let collapsed = `${icon} ${preview}`;
+      if (truncated) {
+        collapsed += "\n" + theme.fg("muted", `... (${lines.length - 5} more lines, Ctrl+O to expand)`);
+      }
+      return new Text(collapsed, 0, 0);
     },
   });
 
