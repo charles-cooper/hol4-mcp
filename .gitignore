@@ -7,3 +7,4 @@ build/
 .hol/
 .agent-files/
 .agent-files.git/
+node_modules/

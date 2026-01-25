@@ -739,7 +739,8 @@ async def hol_cursor_complete(session: str) -> str:
     return "\n".join(lines)
 
 
-if __name__ == "__main__":
+def main():
+    """Entry point for the HOL4 MCP server."""
     import argparse
     import logging
     import sys
@@ -769,3 +770,7 @@ if __name__ == "__main__":
     else:
         print(f"HOL MCP server starting on {args.host}:{args.port} ({args.transport})", file=sys.stderr)
         mcp.run(transport=args.transport, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
