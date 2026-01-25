@@ -196,6 +196,10 @@ class FileProofCursor:
         # Invalidate checkpoints for theorems at or after the change
         if first_changed is not None:
             self._invalidate_checkpoints_from(first_changed)
+            # Also reset loaded context tracking - can't trust context after change point
+            if first_changed <= self._loaded_to_line:
+                self._loaded_to_line = max(0, first_changed - 1)
+                self._loaded_content_hash = None
 
         # Clear active theorem if it was renamed/deleted
         if self._active_theorem:
