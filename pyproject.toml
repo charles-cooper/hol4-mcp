@@ -14,6 +14,15 @@ hol4-mcp = "hol4_mcp.hol_mcp_server:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["hol4_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["hol4_mcp/**/*.ts"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"hol4_mcp/pi_extension/hol4-mcp.ts" = "hol4_mcp/pi_extension/hol4-mcp.ts"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

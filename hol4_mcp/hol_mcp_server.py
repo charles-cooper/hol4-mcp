@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import signal
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -739,24 +740,61 @@ async def hol_cursor_complete(session: str) -> str:
     return "\n".join(lines)
 
 
+def _install_pi_extension():
+    """Install the pi extension to ~/.pi/agent/extensions/."""
+    import shutil
+    
+    # Find the extension file bundled with the package
+    ext_source = Path(__file__).parent / "pi_extension" / "hol4-mcp.ts"
+    if not ext_source.exists():
+        print(f"Error: Extension file not found at {ext_source}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Target directory
+    ext_dir = Path.home() / ".pi" / "agent" / "extensions"
+    ext_dir.mkdir(parents=True, exist_ok=True)
+    
+    ext_target = ext_dir / "hol4-mcp.ts"
+    shutil.copy2(ext_source, ext_target)
+    print(f"Installed pi extension to {ext_target}")
+
+
 def main():
     """Entry point for the HOL4 MCP server."""
     import argparse
     import logging
-    import sys
 
-    parser = argparse.ArgumentParser(description="HOL4 MCP Server")
-    parser.add_argument(
+    parser = argparse.ArgumentParser(description="HOL4 MCP Server and Tools")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # install-pi subcommand
+    subparsers.add_parser("install-pi", help="Install pi extension to ~/.pi/agent/extensions/")
+
+    # serve subcommand (default behavior)
+    serve_parser = subparsers.add_parser("serve", help="Run the MCP server (default)")
+    serve_parser.add_argument(
         "--transport",
         choices=["stdio", "http", "sse"],
         default="stdio",
         help="Transport protocol (default: stdio)",
     )
-    parser.add_argument("--port", type=int, default=8000, help="Port for HTTP/SSE (default: 8000)")
-    parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP/SSE (default: 127.0.0.1)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    serve_parser.add_argument("--port", type=int, default=8000, help="Port for HTTP/SSE (default: 8000)")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP/SSE (default: 127.0.0.1)")
+    serve_parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+
+    # Also allow serve options at top level for backwards compat
+    parser.add_argument("--transport", choices=["stdio", "http", "sse"], default="stdio", help=argparse.SUPPRESS)
+    parser.add_argument("--port", type=int, default=8000, help=argparse.SUPPRESS)
+    parser.add_argument("--host", default="127.0.0.1", help=argparse.SUPPRESS)
+    parser.add_argument("-v", "--verbose", action="store_true", help=argparse.SUPPRESS)
+
     args = parser.parse_args()
 
+    if args.command == "install-pi":
+        _install_pi_extension()
+        return
+
+    # Default to serve behavior
     if args.verbose:
         logging.basicConfig(
             level=logging.DEBUG,
