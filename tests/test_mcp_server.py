@@ -70,8 +70,8 @@ async def test_session_lifecycle(workdir):
         assert "Session 'test' stopped" in result
 
 
-async def test_goaltree_mode(workdir):
-    """Test goaltree mode proving."""
+async def test_goaltree_raw_hol_send(workdir):
+    """Test goaltree mode via raw hol_send (not cursor - cursor uses goalstack only)."""
     await hol_stop(session="gt_test")
     await hol_start(workdir=workdir, name="gt_test")
 

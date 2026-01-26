@@ -126,7 +126,7 @@ class FileProofCursor:
     """
 
     def __init__(self, source_file: Path, session: HOLSession, *,
-                 checkpoint_dir: Path | None = None, mode: str = "g",
+                 checkpoint_dir: Path | None = None,
                  tactic_timeout: float = 5.0, max_checkpoints: int = 100):
         """Initialize file proof cursor.
 
@@ -134,20 +134,13 @@ class FileProofCursor:
             source_file: Path to the SML script
             session: HOL session to use
             checkpoint_dir: Where to store checkpoints (default: .hol/cursor_checkpoints/)
-            mode: "g" for goalstack (default) or "gt" for goaltree
-                  - goalstack: uses g/e(tactic)/b(), no proof extraction
-                  - goaltree: uses gt/e(tactic)/b(), p() extracts proof script
-                  Note: b() and backup() are the same function in HOL
             tactic_timeout: Max seconds per tactic (default 5.0, None=unlimited)
             max_checkpoints: Max theorem checkpoints to keep (default 100, LRU eviction)
         """
         self.file = source_file
         self.session = session
 
-        # Mode: "g" (goalstack) or "gt" (goaltree)
-        if mode not in ("g", "gt"):
-            raise ValueError(f"mode must be 'g' or 'gt', got '{mode}'")
-        self._mode = mode
+        # Always use goalstack mode - goaltree doesn't support eall() needed for replay
         
         # Tactic timeout for build discipline
         self._tactic_timeout = tactic_timeout
@@ -662,8 +655,7 @@ class FileProofCursor:
         # Set up goal
         await self.session.send('drop_all();', timeout=5)
         goal = thm.goal.replace('\n', ' ').strip()
-        goal_cmd = "g" if self._mode == "g" else "gt"
-        gt_result = await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
+        gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
         if _is_hol_error(gt_result):
             return {"error": f"Failed to set up goal: {gt_result[:300]}"}
 
@@ -885,8 +877,7 @@ class FileProofCursor:
             # Build checkpoint: replay all steps, then backup
             await self.session.send('drop_all();', timeout=5)
             goal = thm.goal.replace('\n', ' ').strip()
-            goal_cmd = "g" if self._mode == "g" else "gt"
-            gt_result = await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
+            gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
             if _is_hol_error(gt_result):
                 self._proof_initialized = False
                 return StateAtResult(

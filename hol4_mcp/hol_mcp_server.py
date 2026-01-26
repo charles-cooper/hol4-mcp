@@ -535,7 +535,6 @@ async def hol_file_init(
     file: str,
     session: str = "default",
     workdir: str = None,
-    mode: str = "g",
     tactic_timeout: float = 5.0,
 ) -> str:
     """Initialize cursor for a HOL4 script file.
@@ -547,7 +546,6 @@ async def hol_file_init(
         file: Path to *Script.sml file containing theorems
         session: Session name (default: "default")
         workdir: Working directory for HOL (default: file's parent directory)
-        mode: "g" goalstack (default) or "gt" goaltree (enables tactic extraction)
         tactic_timeout: Max seconds per tactic (default 5.0). Enforces fast proofs.
 
     Returns: List of theorems with line numbers and cheat status
@@ -579,7 +577,7 @@ async def hol_file_init(
     import time
     t0 = time.perf_counter()
     
-    cursor = FileProofCursor(file_path, s, mode=mode, tactic_timeout=tactic_timeout)
+    cursor = FileProofCursor(file_path, s, tactic_timeout=tactic_timeout)
     result = await cursor.init()
     
     init_time = time.perf_counter() - t0
