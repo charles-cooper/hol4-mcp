@@ -411,45 +411,20 @@ fun step_plan proofBody =
 
   in
     if hasThenLTAtTop tree then
-      (* Special handling for top-level ThenLT:
-         1. Extract base Then chain
-         2. Linearize and step through base
-         3. Add ONE final step for the >- suffix *)
+      (* Top-level ThenLT (>-) CANNOT be decomposed reliably.
+         
+         The problem: >> (THEN) applies tactics to ALL subgoals with complex
+         coordination that we can't replicate with separate e()/eall() calls.
+         For example, gvs[] might solve some goals entirely, causing >- to fail
+         when applied to the remaining goals.
+         
+         Safe choice: treat the entire ThenLT proof as ONE step.
+         This sacrifices navigation granularity but ensures correctness. *)
       let
-        val base = extractThenLTBase tree
-        val baseFrags = TacticParse.linearize isAtom base
-        val baseEndPositions = collectEnds baseFrags []
-        
-        (* Steps for the base Then chain *)
-        val baseSteps = makeSteps base baseEndPositions 0 true []
-        
-        (* Find where the first >- operator starts in the text.
-           We scan back from the first arm's position to find ">-". *)
-        val firstArmStartOpt = findFirstArmStart tree
-        
-        (* Final step: the entire >- suffix as one atomic operation *)
-        val thenLTStep = case firstArmStartOpt of
-            SOME armStart =>
-              let
-                (* Find ">-" operator position by scanning back from arm *)
-                val opStart = findThenLTOperator proofBody armStart
-                (* Extract ">- d >- e" suffix from original text *)
-                val suffix = String.substring(proofBody, opStart, fullEnd - opStart)
-                (* Build: eall(ALL_TAC >- d >- e); *)
-                val cmd = "eall(ALL_TAC " ^ suffix ^ ");\n"
-              in
-                [(fullEnd, cmd)]
-              end
-          | NONE => 
-              (* Fallback: treat whole thing as one step *)
-              let
-                val frags = TacticParse.sliceTacticBlock 0 fullEnd false defaultSpan tree
-                val cmd = TacticParse.printFragsAsE proofBody frags
-              in
-                [(fullEnd, cmd)]
-              end
+        val frags = TacticParse.sliceTacticBlock 0 fullEnd false defaultSpan tree
+        val cmd = TacticParse.printFragsAsE proofBody frags
       in
-        baseSteps @ thenLTStep
+        [(fullEnd, cmd)]
       end
     else
       (* No ThenLT at top: normal linearization *)

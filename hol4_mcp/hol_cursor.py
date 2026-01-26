@@ -28,11 +28,15 @@ def _is_hol_error(output: str) -> bool:
     Returns False for:
     - HOL warnings/messages ("<<HOL message:", "<<HOL warning:")
     - The word "Exception" in identifiers (e.g., "no_ReturnException")
+    - "goal has already been proved" (proof completed early, not an error)
     """
     if output.startswith("TIMEOUT"):
         return True
     if output.lstrip().startswith("ERROR:") or output.lstrip().startswith("Error:"):
         return True
+    # "goal has already been proved" means proof completed - not an error
+    if "goal has already been proved" in output:
+        return False
     # Poly/ML uncaught exception format: "Exception- Fail ..." or "Exception- HOL_ERR ..."
     if any(line.startswith("Exception- ") for line in output.split('\n')):
         return True
@@ -594,9 +598,10 @@ class FileProofCursor:
             )
 
         # Convert (line, col) to proof body offset
-        # If on QED line, use end of proof body
         if line == qed_line:
-            proof_body_offset = len(thm.proof_body)
+            # On QED line: we want ALL tactics executed
+            # Use a large offset to ensure all step.end comparisons pass
+            proof_body_offset = float('inf')
         else:
             file_offset = line_col_to_offset(line, col, self._line_starts)
             proof_body_offset = max(0, file_offset - thm.proof_body_offset)
