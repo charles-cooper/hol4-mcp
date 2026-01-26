@@ -53,6 +53,32 @@ def _is_hol_error(output: str) -> bool:
     return False
 
 
+def _is_fatal_hol_error(output: str) -> bool:
+    """Check if HOL output indicates a fatal error that prevents further loading.
+    
+    Unlike _is_hol_error, this ignores proof/tactic failures (HOL_ERR from by/prove)
+    since those just mean a theorem wasn't defined but don't break the session.
+    
+    Returns True only for:
+    - TIMEOUT
+    - Poly/ML syntax errors ("poly: : error:")
+    - Static errors (parse/type errors)
+    
+    Returns False for:
+    - HOL_ERR from proof failures (theorem just won't be defined)
+    - Tactic Fail (same)
+    """
+    if output.startswith("TIMEOUT"):
+        return True
+    # Poly/ML syntax/parse errors are fatal
+    if "poly: : error:" in output.lower():
+        return True
+    # "Static Errors" from Poly/ML parser
+    if "Static Errors" in output:
+        return True
+    return False
+
+
 async def get_script_dependencies(script_path: Path) -> list[str]:
     """Get dependencies using holdeptool.exe.
 
@@ -535,16 +561,10 @@ class FileProofCursor:
         # Verify all non-cheat theorems (stop on first failure)
         verify_result = await self._verify_all_theorems()
 
-        # Load ALL remaining file content (verification may have stopped early)
-        # This ensures base checkpoint has full file for navigation to any theorem
-        last_thm = self._theorems[-1] if self._theorems else None
-        if last_thm and last_thm.proof_end_line > self._loaded_to_line:
-            content_lines = self._content.split('\n')
-            to_load = '\n'.join(content_lines[self._loaded_to_line:last_thm.proof_end_line])
-            if to_load.strip():
-                # Ignore errors - some content may fail but we want to load what we can
-                await self.session.send(to_load, timeout=300)
-            self._loaded_to_line = last_thm.proof_end_line
+        # Load remaining file content theorem-by-theorem
+        # This handles broken cheat proofs gracefully - each failure is isolated
+        # so definitions/theorems after a broken proof are still processed
+        await self._load_remaining_content()
 
         # Save base checkpoint AFTER all content loaded
         # This makes theorem checkpoints ~1MB (just goal state) instead of ~14MB
@@ -590,14 +610,54 @@ class FileProofCursor:
         
         return {"verified": verified, "total": len(non_cheat_thms), "broken": None}
 
-    async def _load_context_to_line(self, target_line: int, timeout: float = 300) -> str | None:
+    async def _load_remaining_content(self) -> None:
+        """Load remaining file content after verification, theorem by theorem.
+        
+        Handles broken proofs gracefully by loading each theorem separately.
+        This ensures that a proof failure in one theorem doesn't prevent
+        loading of subsequent definitions/theorems.
+        """
+        content_lines = self._content.split('\n')
+        
+        # Find theorems we haven't loaded yet
+        remaining_thms = [t for t in self._theorems if t.proof_end_line > self._loaded_to_line]
+        
+        for thm in remaining_thms:
+            # Load any content between current position and theorem start
+            if thm.start_line > self._loaded_to_line:
+                to_load = '\n'.join(content_lines[self._loaded_to_line:thm.start_line - 1])
+                if to_load.strip():
+                    await self.session.send(to_load, timeout=60)
+                self._loaded_to_line = thm.start_line
+            
+            # Load the theorem (header through QED)
+            thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line])
+            if thm_content.strip():
+                # Ignore errors - proof failures are expected for broken cheat theorems
+                await self.session.send(thm_content, timeout=60)
+            self._loaded_to_line = thm.proof_end_line + 1
+        
+        # Load any trailing content after last theorem
+        last_thm = self._theorems[-1] if self._theorems else None
+        if last_thm:
+            total_lines = len(content_lines)
+            if self._loaded_to_line <= total_lines:
+                trailing = '\n'.join(content_lines[self._loaded_to_line - 1:])
+                if trailing.strip():
+                    await self.session.send(trailing, timeout=60)
+                self._loaded_to_line = total_lines + 1
+
+    async def _load_context_to_line(self, target_line: int, timeout: float = 300, strict: bool = False) -> str | None:
         """Load file content up to target_line into HOL session.
         
-        Tracks what's been loaded to avoid reloading. Only loads the delta.
+        Loads content granularly - theorem by theorem - so that a broken proof
+        in one theorem doesn't prevent loading of subsequent content.
         
         Args:
             target_line: 1-indexed line to load up to (exclusive)
             timeout: Timeout for HOL send (default 300s for large files)
+            strict: If True, any HOL error fails. If False (default), only fatal
+                    errors (syntax, timeout) fail - proof failures are tolerated.
             
         Returns:
             Error message if failed, None if success.
@@ -606,15 +666,54 @@ class FileProofCursor:
             return None  # Already loaded
             
         content_lines = self._content.split('\n')
-        # _loaded_to_line=0 means nothing loaded, so start from line 0 (index 0)
-        # _loaded_to_line=N means lines 1..N-1 loaded, so start from index N-1
-        start_idx = max(0, self._loaded_to_line - 1) if self._loaded_to_line > 0 else 0
-        to_load = '\n'.join(content_lines[start_idx:target_line - 1])
+        check = _is_hol_error if strict else _is_fatal_hol_error
         
-        if to_load.strip():
-            result = await self.session.send(to_load, timeout=timeout)
-            if _is_hol_error(result):
-                return f"Failed to load context: {result[:300]}"
+        # Find theorems that are in the range we need to load
+        # These need special handling because broken proofs can stop HOL processing
+        theorems_in_range = [
+            t for t in self._theorems
+            if self._loaded_to_line < t.proof_end_line <= target_line
+        ]
+        
+        if not theorems_in_range:
+            # No theorems in range - simple case, load everything at once
+            start_idx = max(0, self._loaded_to_line - 1) if self._loaded_to_line > 0 else 0
+            to_load = '\n'.join(content_lines[start_idx:target_line - 1])
+            if to_load.strip():
+                result = await self.session.send(to_load, timeout=timeout)
+                if check(result):
+                    return f"Failed to load context: {result[:300]}"
+        else:
+            # Theorems in range - load piece by piece to isolate failures
+            current_line = self._loaded_to_line
+            
+            for thm in theorems_in_range:
+                # Load content before this theorem
+                if thm.start_line > current_line:
+                    start_idx = current_line - 1 if current_line > 0 else 0
+                    pre_content = '\n'.join(content_lines[start_idx:thm.start_line - 1])
+                    if pre_content.strip():
+                        result = await self.session.send(pre_content, timeout=timeout)
+                        if check(result):
+                            return f"Failed to load context: {result[:300]}"
+                
+                # Load the theorem itself (may fail if proof is broken, that's OK in lenient mode)
+                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line])
+                if thm_content.strip():
+                    result = await self.session.send(thm_content, timeout=timeout)
+                    if check(result):
+                        return f"Failed to load context: {result[:300]}"
+                
+                current_line = thm.proof_end_line + 1
+            
+            # Load remaining content after last theorem (up to target_line)
+            if current_line < target_line:
+                start_idx = current_line - 1
+                remaining = '\n'.join(content_lines[start_idx:target_line - 1])
+                if remaining.strip():
+                    result = await self.session.send(remaining, timeout=timeout)
+                    if check(result):
+                        return f"Failed to load context: {result[:300]}"
         
         # Update tracking
         loaded_content = '\n'.join(content_lines[:target_line - 1])
