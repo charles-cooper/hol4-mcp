@@ -555,8 +555,13 @@ async def hol_file_init(
             return start_result
         s = _get_session(session)
 
+    import time
+    t0 = time.perf_counter()
+    
     cursor = FileProofCursor(file_path, s, mode=mode, tactic_timeout=tactic_timeout)
     result = await cursor.init()
+    
+    init_time = time.perf_counter() - t0
 
     _sessions[session].cursor = cursor
 
@@ -584,6 +589,9 @@ async def hol_file_init(
         lines.append("Cheats to fix:")
         for cheat in result['cheats']:
             lines.append(f"  {cheat['theorem']} (line {cheat['line']})")
+
+    lines.append("")
+    lines.append(f"[Init time: {init_time*1000:.0f}ms]")
 
     return "\n".join(lines)
 
@@ -668,6 +676,14 @@ async def hol_state_at(
         lines.append("No goals")
     else:
         lines.append("No goals (proof complete)")
+
+    # Add timing info if available
+    if result.timings:
+        t = result.timings
+        lines.append("")
+        lines.append(f"[Timing: total={t.get('total', 0)*1000:.0f}ms, "
+                     f"replay={t.get('replay', 0)*1000:.0f}ms, "
+                     f"checkpoint={'yes' if t.get('used_checkpoint') else 'no'}]")
 
     return "\n".join(lines)
 

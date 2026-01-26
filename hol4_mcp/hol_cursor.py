@@ -301,7 +301,13 @@ class FileProofCursor:
         result = await self.session.send(
             f'PolyML.SaveState.loadState "{ckpt_path_str}";', timeout=30
         )
-        return not _is_hol_error(result)
+        if not _is_hol_error(result):
+            # Base has all file content, mark as fully loaded
+            last_thm = self._theorems[-1] if self._theorems else None
+            self._loaded_to_line = last_thm.proof_end_line if last_thm else 0
+            self._loaded_content_hash = self._content_hash
+            return True
+        return False
 
     def _is_checkpoint_valid(self, theorem_name: str) -> bool:
         """Check if cached checkpoint exists and file is present."""
@@ -318,8 +324,9 @@ class FileProofCursor:
         Call this when goaltree has all tactics applied. The checkpoint
         captures this state for fast state_at via loadState + backup_n.
 
-        Strategy: Load base checkpoint first to establish correct parent,
-        then save theorem checkpoint as child (~1.4MB instead of ~132MB).
+        Strategy: Save current state directly - no reload needed.
+        The session already has base as parent (from init), context loaded,
+        and tactics replayed. Just call saveChild to capture the delta.
 
         Returns True if checkpoint was saved successfully.
         """
@@ -330,51 +337,17 @@ class FileProofCursor:
         ckpt_path = self._get_checkpoint_path(theorem_name, "end_of_proof")
         ckpt_path_str = escape_sml_string(str(ckpt_path))
 
-        # Load base checkpoint to establish correct parent hierarchy
-        if not await self._load_base_checkpoint():
-            return False
-
-        # Now replay theorem context and tactics on top of base
-        thm = self._get_theorem(theorem_name)
-        if not thm:
-            return False
-
-        # Load context up to theorem start
-        if thm.start_line > 1:
-            content_lines = self._content.split('\n')
-            to_load = '\n'.join(content_lines[:thm.start_line - 1])
-            if to_load.strip():
-                result = await self.session.send(to_load, timeout=300)
-                if _is_hol_error(result):
-                    return False
-
-        # Set up goal and replay all tactics
-        await self.session.send('drop_all();', timeout=5)
-        goal = thm.goal.replace('\n', ' ').strip()
-        goal_cmd = "g" if self._mode == "g" else "gt"
-        gt_result = await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
-        if _is_hol_error(gt_result):
-            return False
-
-        # Execute all tactics
-        if thm.proof_body and self._step_plan:
-            step_cmds = "".join(step.cmd for step in self._step_plan)
-            if step_cmds.strip():
-                batch_timeout = max(30, int((self._tactic_timeout or 5) * len(self._step_plan)))
-                result = await self.session.send(step_cmds, timeout=batch_timeout)
-                if _is_hol_error(result):
-                    return False
-
-        # Get current hierarchy depth (should be base_depth + 1)
+        # Get current hierarchy depth and save as child
+        # Base is at depth 3, so theorem checkpoint is at depth 4
         depth_result = await self.session.send(
             'length (PolyML.SaveState.showHierarchy());', timeout=5
         )
         try:
-            depth = int(depth_result.strip().split()[-1])
+            depth = int(depth_result.strip().split()[-1]) + 1  # Child of current hierarchy
         except (ValueError, IndexError):
             depth = 4  # base_depth (3) + 1
 
-        # Save child checkpoint at current depth (~1.4MB)
+        # Save checkpoint directly from current state
         result = await self.session.send(
             f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=30
         )
@@ -391,8 +364,8 @@ class FileProofCursor:
     async def _load_checkpoint_and_backup(self, theorem_name: str, target_tactic_idx: int) -> bool:
         """Load checkpoint and backup to target position.
 
-        Strategy: Load base checkpoint first, then theorem checkpoint, then backup.
-        This allows theorem checkpoints to be small (~1.4MB) children of base.
+        Strategy: Just load theorem checkpoint - Poly/ML auto-loads parent chain.
+        No need to explicitly load base first.
 
         Args:
             theorem_name: Theorem whose checkpoint to load
@@ -404,17 +377,19 @@ class FileProofCursor:
         if not ckpt or not self._is_checkpoint_valid(theorem_name):
             return False
 
-        # Load base checkpoint first (establishes parent hierarchy)
-        if not await self._load_base_checkpoint():
-            return False
-
-        # Load theorem checkpoint (~1.4MB, ~70-120ms)
+        # Load theorem checkpoint - Poly/ML auto-loads parent chain (base)
         ckpt_path_str = escape_sml_string(str(ckpt.end_of_proof_path))
         result = await self.session.send(
             f'PolyML.SaveState.loadState "{ckpt_path_str}";', timeout=30
         )
         if _is_hol_error(result):
             return False
+        
+        # Checkpoint (child of base) has all file content, mark as fully loaded
+        # Use a high value to indicate all content is available
+        last_thm = self._theorems[-1] if self._theorems else None
+        self._loaded_to_line = last_thm.proof_end_line if last_thm else 0
+        self._loaded_content_hash = self._content_hash  # Full file hash
 
         # Backup to target position (~11ms for any N)
         backups_needed = ckpt.tactics_count - target_tactic_idx
@@ -478,10 +453,6 @@ class FileProofCursor:
         except FileNotFoundError:
             pass  # holdeptool not available, skip dep loading
 
-        # Save base checkpoint after deps loaded (132MB once)
-        # Theorem checkpoints saved as children are only ~1.4MB
-        await self._save_base_checkpoint()
-
         thm_list = [
             {"name": t.name, "line": t.start_line, "has_cheat": t.has_cheat}
             for t in self._theorems
@@ -498,6 +469,22 @@ class FileProofCursor:
 
         # Verify all non-cheat theorems (stop on first failure)
         verify_result = await self._verify_all_theorems()
+
+        # Load ALL remaining file content (verification may have stopped early)
+        # This ensures base checkpoint has full file for navigation to any theorem
+        last_thm = self._theorems[-1] if self._theorems else None
+        if last_thm and last_thm.proof_end_line > self._loaded_to_line:
+            content_lines = self._content.split('\n')
+            to_load = '\n'.join(content_lines[self._loaded_to_line:last_thm.proof_end_line])
+            if to_load.strip():
+                # Ignore errors - some content may fail but we want to load what we can
+                await self.session.send(to_load, timeout=300)
+            self._loaded_to_line = last_thm.proof_end_line
+
+        # Save base checkpoint AFTER all content loaded
+        # This makes theorem checkpoints ~1MB (just goal state) instead of ~14MB
+        await self.session.send('drop_all();', timeout=5)  # Clean proof state
+        await self._save_base_checkpoint()
         
         return {
             "theorems": thm_list,
