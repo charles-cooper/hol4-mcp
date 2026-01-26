@@ -396,7 +396,8 @@ class FileProofCursor:
     async def _verify_all_theorems(self) -> dict:
         """Verify all non-cheat theorems by replaying their tactics.
         
-        Stops on first failure. Builds checkpoints for verified theorems.
+        Stops on first failure. Does NOT save checkpoints (that's expensive
+        and only needed for interactive navigation).
         
         Returns:
             dict with:
@@ -408,46 +409,86 @@ class FileProofCursor:
         verified = 0
         
         for thm in non_cheat_thms:
-            # Use state_at to replay all tactics (goes to end of proof)
-            # This will enter the theorem, load context, and replay tactics
-            end_line = thm.proof_end_line - 1  # Line before QED
-            result = await self.state_at(end_line)
-            
-            # Check for tactic errors (not goals_json errors)
-            # If all tactics replayed but goals_json says "no goals", that's actually success
-            is_no_goals_error = (
-                result.error and 
-                "no goals" in result.error.lower() and
-                result.tactics_replayed == result.tactics_total
-            )
-            
-            if result.error and not is_no_goals_error:
+            result = await self._verify_single_theorem(thm)
+            if result.get("error"):
                 return {
                     "verified": verified,
                     "total": len(non_cheat_thms),
                     "broken": {
                         "name": thm.name,
                         "line": thm.start_line,
-                        "error": result.error,
+                        "error": result["error"],
                     }
                 }
-            
-            # Check that proof is complete (no remaining goals)
-            # Empty goals with no error OR "no goals" error = proof complete
-            if result.goals and not is_no_goals_error:
-                return {
-                    "verified": verified,
-                    "total": len(non_cheat_thms),
-                    "broken": {
-                        "name": thm.name,
-                        "line": thm.start_line,
-                        "error": f"Proof incomplete: {len(result.goals)} goals remaining",
-                    }
-                }
-            
             verified += 1
         
         return {"verified": verified, "total": len(non_cheat_thms), "broken": None}
+
+    async def _verify_single_theorem(self, thm: TheoremInfo) -> dict:
+        """Verify a single theorem by replaying tactics. No checkpoint saved.
+        
+        Returns: {"error": str} if failed, {} if success.
+        """
+        # Load context up to theorem start (if not already loaded)
+        if thm.start_line > self._loaded_to_line:
+            content_lines = self._content.split('\n')
+            start_idx = max(0, self._loaded_to_line - 1) if self._loaded_to_line > 0 else 0
+            to_load = '\n'.join(content_lines[start_idx:thm.start_line - 1])
+            if to_load.strip():
+                result = await self.session.send(to_load, timeout=300)
+                if _is_hol_error(result):
+                    return {"error": f"Failed to load context: {result[:300]}"}
+            loaded_content = '\n'.join(content_lines[:thm.start_line - 1])
+            self._loaded_to_line = thm.start_line
+            self._loaded_content_hash = self._compute_hash(loaded_content)
+
+        # Get step plan for this theorem
+        if thm.proof_body:
+            escaped_body = escape_sml_string(thm.proof_body)
+            step_result = await self.session.send(
+                f'step_plan_json "{escaped_body}";', timeout=30
+            )
+            try:
+                step_plan = parse_step_plan_output(step_result)
+            except HOLParseError as e:
+                return {"error": f"Failed to parse step plan: {e}"}
+        else:
+            step_plan = []
+
+        # Set up goal
+        await self.session.send('drop_all();', timeout=5)
+        goal = thm.goal.replace('\n', ' ').strip()
+        goal_cmd = "g" if self._mode == "g" else "gt"
+        gt_result = await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
+        if _is_hol_error(gt_result):
+            return {"error": f"Failed to set up goal: {gt_result[:300]}"}
+
+        # Execute all tactics
+        if step_plan:
+            step_cmds = "".join(step.cmd for step in step_plan)
+            if step_cmds.strip():
+                batch_timeout = max(30, int((self._tactic_timeout or 5) * len(step_plan)))
+                result = await self.session.send(step_cmds, timeout=batch_timeout)
+                if _is_hol_error(result):
+                    if result.startswith("TIMEOUT"):
+                        return {"error": f"Tactic replay timed out (>{batch_timeout}s)"}
+                    else:
+                        return {"error": f"Tactic replay failed: {result[:200]}"}
+
+        # Check proof is complete
+        goals_output = await self.session.send('goals_json();', timeout=10)
+        try:
+            goals = self._parse_goals_json(goals_output)
+        except HOLParseError as e:
+            # "no goals" error at end of proof is success
+            if "no goals" in str(e).lower():
+                return {}
+            return {"error": str(e)}
+
+        if goals:
+            return {"error": f"Proof incomplete: {len(goals)} goals remaining"}
+
+        return {}
 
     async def enter_theorem(self, name: str) -> dict:
         """Enter a theorem for proof state inspection.
