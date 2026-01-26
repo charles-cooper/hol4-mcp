@@ -53,9 +53,23 @@ def _is_hol_error(output: str) -> bool:
     return False
 
 
-async def get_script_dependencies(script_path: Path) -> list[str]:
-    """Get dependencies using holdeptool.exe.
+def is_loadable_dep(dep: str) -> bool:
+    """Check if a dependency is loadable (has .ui file in sigobj).
+    
+    holdeptool returns all 'open' statements including build-time deps like
+    HolKernel, Parse, etc. These don't have .ui files in sigobj.
+    Loadable deps (theories, libraries) have corresponding .ui files.
+    """
+    ui_path = HOLDIR / "sigobj" / f"{dep}.ui"
+    return ui_path.exists()
 
+
+async def get_script_dependencies(script_path: Path) -> list[str]:
+    """Get loadable dependencies using holdeptool.exe.
+
+    Filters to deps that have .ui files in sigobj (actual loadable modules).
+    Build-time deps (HolKernel, Parse, etc.) are excluded.
+    
     Raises FileNotFoundError if holdeptool.exe doesn't exist.
     """
     holdeptool = HOLDIR / "bin" / "holdeptool.exe"
@@ -71,7 +85,8 @@ async def get_script_dependencies(script_path: Path) -> list[str]:
     if proc.returncode != 0:
         raise RuntimeError(f"holdeptool.exe failed: {stderr.decode()}")
 
-    return [line.strip() for line in stdout.decode().splitlines() if line.strip()]
+    all_deps = [line.strip() for line in stdout.decode().splitlines() if line.strip()]
+    return [dep for dep in all_deps if is_loadable_dep(dep)]
 
 
 # =============================================================================
@@ -500,9 +515,7 @@ class FileProofCursor:
         if not self.session.is_running:
             await self.session.start()
 
-        # Load dependencies from holdeptool
-        # Note: holdeptool returns all deps including build-time ones (HolKernel, Parse, etc.)
-        # These are already loaded by HOL, so re-loading them is a no-op but safe.
+        # Load dependencies from holdeptool (pre-filtered to loadable deps only)
         try:
             deps = await get_script_dependencies(self.file)
             for dep in deps:
