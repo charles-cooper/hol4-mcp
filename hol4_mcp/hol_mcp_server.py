@@ -171,7 +171,7 @@ async def hol_sessions() -> str:
 
 
 @mcp.tool()
-async def hol_send(session: str, command: str, timeout: int = 5) -> str:
+async def hol_send(session: str, command: str, timeout: int = 5, max_output: int = 4096) -> str:
     """Send raw SML command to HOL session.
 
     WARNING: Do NOT use for proof navigation - use hol_state_at instead.
@@ -188,8 +188,10 @@ async def hol_send(session: str, command: str, timeout: int = 5) -> str:
         session: Session name
         command: SML command to execute
         timeout: Max seconds to wait (default 5, max 600)
+        max_output: Max bytes of output to return (default 4096).
+                    Shows tail when truncated (errors/results come after echoed input).
 
-    Returns: HOL output (may include errors)
+    Returns: HOL output (may include errors), truncated if exceeds max_output
     """
     s = _get_session(session)
     if not s:
@@ -205,7 +207,17 @@ async def hol_send(session: str, command: str, timeout: int = 5) -> str:
     elif timeout > 600:
         timeout = 600
 
-    return await s.send(command, timeout=timeout)
+    # Validate max_output
+    if max_output < 1:
+        return f"ERROR: max_output must be positive (got {max_output})"
+
+    result = await s.send(command, timeout=timeout)
+    
+    # Truncate if needed (show tail - errors/results come after echoed input)
+    if len(result) > max_output:
+        return f"[TRUNCATED: {len(result)} bytes, showing last {max_output}]\n\n{result[-max_output:]}"
+    
+    return result
 
 
 @mcp.tool()
