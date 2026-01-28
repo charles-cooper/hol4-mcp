@@ -6,6 +6,7 @@ Sessions are in-memory only. They survive within a single MCP server lifetime
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -601,7 +602,7 @@ async def hol_file_init(
     # Determine target workdir
     target_workdir = Path(workdir).resolve() if workdir else file_path.parent
 
-    # Auto-start or restart session if workdir changed
+    # Auto-start or restart session if workdir changed or file content changed
     s = _get_session(session)
     entry = _sessions.get(session)
 
@@ -610,6 +611,18 @@ async def hol_file_init(
         if entry and entry.workdir != target_workdir:
             await hol_stop.fn(session)
             s = None
+        # Check if file content changed - session has stale definitions
+        elif entry and entry.cursor:
+            old_cursor = entry.cursor
+            if Path(old_cursor.file).resolve() == file_path:
+                # Same file - check if content changed
+                old_hash = old_cursor._content_hash
+                new_content = file_path.read_text()
+                new_hash = hashlib.sha256(new_content.encode()).hexdigest()
+                if old_hash and new_hash != old_hash:
+                    # File changed - restart session to clear stale definitions
+                    await hol_stop.fn(session)
+                    s = None
 
     if not s or not s.is_running:
         start_result = await hol_start.fn(workdir=str(target_workdir), name=session)
