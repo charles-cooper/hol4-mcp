@@ -630,7 +630,6 @@ async def hol_file_init(
             return start_result
         s = _get_session(session)
 
-    import time
     t0 = time.perf_counter()
     
     cursor = FileProofCursor(file_path, s, tactic_timeout=tactic_timeout)
