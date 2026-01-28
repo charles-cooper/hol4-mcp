@@ -73,6 +73,8 @@ class HOLSession:
         await self._read_response(timeout=60)
 
         # Load etq.sml (goaltree mode helpers)
+        # NOTE: Legacy - cursor now uses goalstack mode with tactic_prefix.sml instead.
+        # Kept for backwards compatibility with manual goaltree workflows.
         await self.send(ETQ_PATH.read_text(), timeout=30)
 
         # Load tactic_prefix for prefix-based replay (includes TacticParse)

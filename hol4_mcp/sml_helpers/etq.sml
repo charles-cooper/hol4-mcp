@@ -1,5 +1,9 @@
 (* etq.sml - "Evaluate Tactic Quoted" for goaltree mode
 
+   NOTE: Legacy - the cursor now uses goalstack mode with tactic_prefix.sml
+   instead (goaltree doesn't support eall() needed for >> replay).
+   Kept for backwards compatibility with manual goaltree workflows.
+
    Mirrors HOL's etqLib but with output optimizations:
    - Returns unit (not proof) to avoid REPL auto-printing the proof tree
    - Prints only goal count + first goal (not all goals)
