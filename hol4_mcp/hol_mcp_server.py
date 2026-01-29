@@ -710,6 +710,11 @@ async def hol_state_at(
         not result.goals
     )
     
+    # Structural error (not in theorem, etc.) - no goals to show
+    if result.error and result.tactics_total == 0:
+        lines.append(f"ERROR: {result.error}")
+        return "\n".join(lines)
+    
     # Show position info - clarify if we couldn't reach requested position
     if result.error and result.tactics_replayed < result.tactic_idx:
         lines.append(f"Requested: Tactic {result.tactic_idx}/{result.tactics_total}")
@@ -736,8 +741,6 @@ async def hol_state_at(
             lines.append(f"  {g['goal']}")
     elif is_proof_complete:
         lines.append("No goals (proof complete)")
-    elif result.error:
-        lines.append("No goals")
     else:
         lines.append("No goals (proof complete)")
 
