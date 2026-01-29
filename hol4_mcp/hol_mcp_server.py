@@ -753,13 +753,14 @@ async def hol_state_at(
 
 
 @mcp.tool()
-async def hol_file_status(session: str, file: str = None, workdir: str = None) -> str:
+async def hol_file_status(session: str, file: str = None, workdir: str = None, timing: bool = True) -> str:
     """Get current cursor position and file status.
 
     Args:
         session: Session name
         file: Path to .sml file (auto-inits cursor if no cursor exists)
         workdir: Working directory for HOL (used with file)
+        timing: If True, run all proofs and report timing (slower)
 
     Returns: File info, active theorem, theorems with cheats, completion status
     """
@@ -809,6 +810,28 @@ async def hol_file_status(session: str, file: str = None, workdir: str = None) -
         for c in status['cheats']:
             marker = " <--" if c['theorem'] == status['active_theorem'] else ""
             lines.append(f"  {c['theorem']} (line {c['line']}){marker}")
+
+    # Run proofs and report timing if requested
+    if timing:
+        lines.append("")
+        lines.append("Proof times:")
+        total_ms = 0
+        for thm in status['theorems']:
+            if thm['has_cheat']:
+                lines.append(f"  {thm['name']}: (cheat)")
+            else:
+                trace = await cursor.execute_proof_traced(thm['name'])
+                if trace:
+                    thm_ms = sum(e.real_ms for e in trace)
+                    total_ms += thm_ms
+                    error = next((e.error for e in trace if e.error), None)
+                    if error:
+                        lines.append(f"  {thm['name']}: {thm_ms}ms (ERROR: {error})")
+                    else:
+                        lines.append(f"  {thm['name']}: {thm_ms}ms")
+                else:
+                    lines.append(f"  {thm['name']}: (no tactics)")
+        lines.append(f"Total: {total_ms}ms")
 
     return "\n".join(lines)
 
