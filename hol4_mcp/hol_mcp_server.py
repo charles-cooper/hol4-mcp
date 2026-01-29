@@ -788,10 +788,7 @@ async def hol_file_status(session: str, file: str = None, workdir: str = None, t
 
     lines = [
         f"File: {status['file']}",
-        f"File hash: {status['file_hash'][:12]}...",
         f"Progress: {len(complete_in_file)}/{total} theorems complete",
-        f"Loaded to line: {status['loaded_to_line']}",
-        f"Stale: {status['stale']}",
         "",
     ]
 
