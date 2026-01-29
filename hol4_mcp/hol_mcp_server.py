@@ -784,54 +784,98 @@ async def hol_file_status(session: str, file: str = None, workdir: str = None, t
         return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
 
     status = cursor.status
-
-    # Count completed theorems (no cheat in file)
-    complete_in_file = [t['name'] for t in status['theorems'] if not t['has_cheat']]
     total = len(status['theorems'])
 
-    lines = [
-        f"File: {status['file']}",
-        f"Progress: {len(complete_in_file)}/{total} theorems complete",
-        "",
-    ]
-
-    if status['active_theorem']:
-        lines.append(f"Active theorem: {status['active_theorem']}")
-        lines.append(f"Active tactics: {status['active_tactics']}")
-    else:
-        lines.append("Active theorem: None")
-
-    lines.append("")
-    lines.append(f"Completed: {', '.join(complete_in_file) or 'None'}")
-
-    if status['cheats']:
-        lines.append("")
-        lines.append(f"Remaining cheats ({len(status['cheats'])}):")
-        for c in status['cheats']:
-            marker = " <--" if c['theorem'] == status['active_theorem'] else ""
-            lines.append(f"  {c['theorem']} (line {c['line']}){marker}")
-
-    # Run proofs and report timing if requested
+    # When timing, we verify proofs by execution; otherwise use static analysis
     if timing:
-        lines.append("")
-        lines.append("Proof times:")
+        # Run proofs and track actual success/failure
+        verified = []
+        failed = []  # (name, error_msg)
+        cheated = []
+        timing_lines = []
         total_ms = 0
+
         for thm in status['theorems']:
             if thm['has_cheat']:
-                lines.append(f"  {thm['name']}: (cheat)")
+                cheated.append(thm['name'])
+                timing_lines.append(f"  {thm['name']}: (cheat)")
             else:
                 trace = await cursor.execute_proof_traced(thm['name'])
                 if trace:
                     thm_ms = sum(e.real_ms for e in trace)
                     total_ms += thm_ms
                     error = next((e.error for e in trace if e.error), None)
+                    # Check proof actually completed (no remaining goals)
+                    final_goals = trace[-1].goals_after if trace else -1
                     if error:
-                        lines.append(f"  {thm['name']}: {thm_ms}ms (ERROR: {error})")
+                        failed.append((thm['name'], error))
+                        timing_lines.append(f"  {thm['name']}: {thm_ms}ms (ERROR: {error})")
+                    elif final_goals != 0:
+                        failed.append((thm['name'], f"incomplete ({final_goals} goals remain)"))
+                        timing_lines.append(f"  {thm['name']}: {thm_ms}ms (INCOMPLETE: {final_goals} goals)")
                     else:
-                        lines.append(f"  {thm['name']}: {thm_ms}ms")
+                        verified.append(thm['name'])
+                        timing_lines.append(f"  {thm['name']}: {thm_ms}ms")
                 else:
-                    lines.append(f"  {thm['name']}: (no tactics)")
+                    timing_lines.append(f"  {thm['name']}: (no tactics)")
+                    # No tactics = likely just goal statement, count as incomplete
+                    failed.append((thm['name'], "no tactics"))
+
+        lines = [
+            f"File: {status['file']}",
+            f"Progress: {len(verified)}/{total} theorems VERIFIED by execution",
+            "",
+        ]
+
+        if status['active_theorem']:
+            lines.append(f"Active theorem: {status['active_theorem']}")
+            lines.append(f"Active tactics: {status['active_tactics']}")
+        else:
+            lines.append("Active theorem: None")
+
+        # Show failures prominently at top
+        if failed:
+            lines.append("")
+            lines.append(f"FAILED ({len(failed)}):")
+            for name, err in failed:
+                lines.append(f"  {name}: {err}")
+
+        if cheated:
+            lines.append("")
+            lines.append(f"Cheated ({len(cheated)}): {', '.join(cheated)}")
+
+        lines.append("")
+        lines.append(f"Verified: {', '.join(verified) or 'None'}")
+
+        lines.append("")
+        lines.append("Proof times:")
+        lines.extend(timing_lines)
         lines.append(f"Total: {total_ms}ms")
+    else:
+        # Static analysis only (fast but unreliable)
+        complete_in_file = [t['name'] for t in status['theorems'] if not t['has_cheat']]
+
+        lines = [
+            f"File: {status['file']}",
+            f"Progress: {len(complete_in_file)}/{total} theorems (static, unverified)",
+            "",
+        ]
+
+        if status['active_theorem']:
+            lines.append(f"Active theorem: {status['active_theorem']}")
+            lines.append(f"Active tactics: {status['active_tactics']}")
+        else:
+            lines.append("Active theorem: None")
+
+        lines.append("")
+        lines.append(f"No cheat keyword: {', '.join(complete_in_file) or 'None'}")
+
+        if status['cheats']:
+            lines.append("")
+            lines.append(f"Has cheat keyword ({len(status['cheats'])}):")
+            for c in status['cheats']:
+                marker = " <--" if c['theorem'] == status['active_theorem'] else ""
+                lines.append(f"  {c['theorem']} (line {c['line']}){marker}")
 
     return "\n".join(lines)
 
