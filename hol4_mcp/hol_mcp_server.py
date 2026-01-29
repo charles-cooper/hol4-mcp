@@ -843,8 +843,8 @@ async def hol_check_proof(
         lines.append("Status: CHEAT (not verified)")
         return "\n".join(lines)
 
-    # Execute proof
-    trace = await cursor.execute_proof_traced(theorem, use_cache=False)
+    # Execute proof (clean mode by default - matches holmake, uses cache)
+    trace = await cursor.execute_proof_traced(theorem)
     
     if not trace:
         lines.append("Status: NO TACTICS (trivial or unparseable)")

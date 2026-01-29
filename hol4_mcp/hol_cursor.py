@@ -1177,39 +1177,33 @@ class FileProofCursor:
             goals_after=data.get('goals_after', 0),
         )
 
-    async def execute_proof_traced(self, theorem_name: str, use_cache: bool = True,
-                                    clean: bool = False) -> list[TraceEntry]:
+    async def execute_proof_traced(self, theorem_name: str) -> list[TraceEntry]:
         """Execute a proof and return timing trace for each tactic.
+
+        Runs in clean state (deps-only checkpoint) to match holmake behavior.
+        Results are cached; cache is invalidated on file changes.
 
         Args:
             theorem_name: Name of theorem to trace
-            use_cache: If True, return cached trace if available (default True)
-            clean: If True, restore to deps-only checkpoint before loading context.
-                   This ensures verification matches holmake behavior.
 
         Returns:
             List of TraceEntry objects for each tactic
         """
-        # Check cache first (only if not forcing clean verification)
-        if use_cache and not clean and theorem_name in self._proof_traces:
+        if theorem_name in self._proof_traces:
             return self._proof_traces[theorem_name]
 
         thm = self._get_theorem(theorem_name)
         if not thm:
             return []
 
-        # For clean verification, restore to deps-only state first
-        if clean and self._deps_checkpoint_saved:
-            restored = await self._restore_to_deps()
-            if not restored:
-                # Fall back to normal behavior if restore fails
-                pass
+        # Restore to deps-only state for holmake-matching verification
+        if self._deps_checkpoint_saved:
+            await self._restore_to_deps()
 
-        # Ensure theorem is active (loads context up to theorem)
-        if self._active_theorem != theorem_name or clean:
-            enter_result = await self.enter_theorem(theorem_name)
-            if "error" in enter_result:
-                return []
+        # Load context up to theorem
+        enter_result = await self.enter_theorem(theorem_name)
+        if "error" in enter_result:
+            return []
 
         # Get tactics from step plan
         tactics = [step.cmd for step in self._step_plan if step.cmd.strip()]
@@ -1249,9 +1243,7 @@ class FileProofCursor:
                 goals_before=0, goals_after=0, error=parsed['err']
             ))
 
-        # Cache the result (only for non-clean runs to avoid polluting cache)
-        if not clean:
-            self._proof_traces[theorem_name] = trace
+        self._proof_traces[theorem_name] = trace
         return trace
 
     async def verify_all_proofs(self) -> dict[str, list[TraceEntry]]:
