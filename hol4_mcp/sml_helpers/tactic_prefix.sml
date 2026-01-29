@@ -519,7 +519,7 @@ fun verify_theorem_json goal name tactics store timeout_sec =
       end
       handle smlTimeout.FunctionTimeout =>
         let val timeout_ms = Real.round (timeout_sec * 1000.0) in
-        (SOME ("{\"err\":\"TIMEOUT\"" ^
+        (SOME ("{\"err\":\"TIMEOUT after " ^ Real.fmt (StringCvt.FIX (SOME 1)) timeout_sec ^ "s\"" ^
                ",\"real_ms\":" ^ Int.toString timeout_ms ^
                ",\"goals_before\":" ^ Int.toString (length (top_goals()) handle _ => 0) ^ "}"), false)
         end

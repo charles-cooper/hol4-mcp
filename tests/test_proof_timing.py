@@ -120,7 +120,7 @@ QED
     assert len(trace) >= 1
 
     entry = trace[0]
-    assert entry.error == "TIMEOUT"
+    assert entry.error == f"TIMEOUT after {timeout_sec:.1f}s"
     # real_ms should be approximately the timeout value (within 200ms tolerance)
     assert abs(entry.real_ms - int(timeout_sec * 1000)) < 200
 

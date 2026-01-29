@@ -23,6 +23,18 @@ from .hol_session import HOLSession, HOLDIR
 from .hol_cursor import FileProofCursor
 
 
+DEFAULT_MAX_OUTPUT = 4096
+
+
+def _truncate_output(output: str, max_output: int) -> str:
+    """Truncate output to max_output bytes, showing tail."""
+    if max_output < 1:
+        return f"ERROR: max_output must be positive (got {max_output})"
+    if len(output) > max_output:
+        return f"[TRUNCATED: {len(output)} bytes, showing last {max_output}]\n\n{output[-max_output:]}"
+    return output
+
+
 @dataclass
 class SessionEntry:
     """Registry entry for a HOL session."""
@@ -171,7 +183,7 @@ async def hol_sessions() -> str:
 
 
 @mcp.tool()
-async def hol_send(session: str, command: str, timeout: int = 5, max_output: int = 4096) -> str:
+async def hol_send(session: str, command: str, timeout: int = 5, max_output: int = DEFAULT_MAX_OUTPUT) -> str:
     """Send raw SML command to HOL session.
 
     WARNING: Do NOT use for proof navigation - use hol_state_at instead.
@@ -207,17 +219,8 @@ async def hol_send(session: str, command: str, timeout: int = 5, max_output: int
     elif timeout > 600:
         timeout = 600
 
-    # Validate max_output
-    if max_output < 1:
-        return f"ERROR: max_output must be positive (got {max_output})"
-
     result = await s.send(command, timeout=timeout)
-    
-    # Truncate if needed (show tail - errors/results come after echoed input)
-    if len(result) > max_output:
-        return f"[TRUNCATED: {len(result)} bytes, showing last {max_output}]\n\n{result[-max_output:]}"
-    
-    return result
+    return _truncate_output(result, max_output)
 
 
 @mcp.tool()
@@ -667,6 +670,7 @@ async def hol_state_at(
     col: int = 1,
     file: str = None,
     workdir: str = None,
+    max_output: int = DEFAULT_MAX_OUTPUT,
 ) -> str:
     """Get proof state at a file position.
 
@@ -679,6 +683,7 @@ async def hol_state_at(
         col: 1-indexed column number (default 1)
         file: Path to .sml file (auto-inits cursor if no cursor exists)
         workdir: Working directory for HOL (used with file)
+        max_output: Max bytes of output (default 1000)
 
     Returns: Tactic position (N/M), goals at that position, errors if any
     """
@@ -777,7 +782,7 @@ async def hol_state_at(
                      f"replay={t.get('replay', 0)*1000:.0f}ms, "
                      f"checkpoint={'yes' if t.get('used_checkpoint') else 'no'}]")
 
-    return "\n".join(lines)
+    return _truncate_output("\n".join(lines), max_output)
 
 
 @mcp.tool()
@@ -798,7 +803,7 @@ async def hol_check_proof(
         file: Path to .sml file (auto-inits cursor if no cursor exists)
         workdir: Working directory for HOL (used with file)
 
-    Returns: Whether proof completes, goals at failure point, line numbers
+    Returns: Whether proof completes, failure location, brief goal summary
     """
     cursor = _get_cursor(session)
 
@@ -845,51 +850,64 @@ async def hol_check_proof(
         lines.append("Status: NO TACTICS (trivial or unparseable)")
         return "\n".join(lines)
 
-    # Find failure point and compute line number
+    # Find failure point
     failed_idx = None
     for i, entry in enumerate(trace):
         if entry.error or (i == len(trace) - 1 and entry.goals_after != 0):
             failed_idx = i
             break
 
-    # Compute line number of failing tactic from step plan offset
-    def tactic_line(idx):
+    # Compute line:col from offset within proof_body
+    def offset_to_pos(offset):
+        if not thm.proof_body or offset < 0:
+            return thm.proof_start_line, 1
+        before = thm.proof_body[:offset]
+        line = thm.proof_start_line + before.count('\n')
+        last_nl = before.rfind('\n')
+        col = offset - last_nl if last_nl >= 0 else offset + 1
+        return line, col
+
+    # Get tactic end position
+    def tactic_pos(idx):
         if idx is None or idx >= len(cursor._step_plan):
-            return thm.proof_start_line  # fallback
-        step = cursor._step_plan[idx]
-        if thm.proof_body:
-            newlines = thm.proof_body[:step.end].count('\n')
-            return thm.proof_start_line + newlines
-        return thm.proof_start_line
+            return thm.proof_start_line, 1
+        return offset_to_pos(cursor._step_plan[idx].end)
+
+    # Get tactic start/end range
+    def tactic_range(idx):
+        if idx is None or idx >= len(cursor._step_plan):
+            return (thm.proof_start_line, 1), (thm.proof_start_line, 1)
+        start_offset = cursor._step_plan[idx - 1].end if idx > 0 else 0
+        end_offset = cursor._step_plan[idx].end
+        return offset_to_pos(start_offset), offset_to_pos(end_offset)
 
     final = trace[-1]
     total_ms = sum(e.real_ms for e in trace)
+    total_steps = len(trace)
     
     if final.error:
-        lines.append(f"Status: FAILED at line {tactic_line(failed_idx)} ({total_ms}ms)")
+        lines.append(f"Status: FAILED at step {failed_idx + 1}/{total_steps} ({total_ms}ms)")
         lines.append(f"Error: {final.error}")
     elif final.goals_after == 0:
-        lines.append(f"Status: OK ({total_ms}ms)")
+        lines.append(f"Status: OK ({total_ms}ms, {total_steps} steps)")
         return "\n".join(lines)
     else:
-        lines.append(f"Status: INCOMPLETE at line {tactic_line(len(trace) - 1)} ({total_ms}ms)")
+        lines.append(f"Status: INCOMPLETE at step {len(trace)}/{total_steps} ({total_ms}ms)")
 
-    # Get goals at failure point
+    # Show failing tactic with location
+    if failed_idx is not None and failed_idx < len(trace):
+        (start_line, start_col), (end_line, end_col) = tactic_range(failed_idx)
+        tactic_text = trace[failed_idx].cmd.strip().replace('\n', ' ')
+        if len(tactic_text) > 80:
+            tactic_text = tactic_text[:77] + "..."
+        loc = f"line/col {start_line}:{start_col}-{end_line}:{end_col}"
+        lines.append(f"Tactic ({loc}): {tactic_text}")
+
+    # Brief goal summary
     lines.append("")
-    goals_output = await cursor.session.send('goals_json();', timeout=10)
-    try:
-        goals = cursor._parse_goals_json(goals_output)
-        lines.append(f"=== Goals ({len(goals)}) ===")
-        for i, g in enumerate(goals):
-            if i > 0:
-                lines.append("")
-            if g.get('asms'):
-                for asm in g['asms']:
-                    lines.append(f"  {asm}")
-                lines.append("  " + "-" * 40)
-            lines.append(f"  {g['goal']}")
-    except:
-        lines.append(f"=== Goals ({final.goals_after}) ===")
+    lines.append(f"Remaining: {final.goals_after} goal(s)")
+    (fail_line, fail_col), _ = tactic_range(failed_idx)
+    lines.append(f"Use hol_state_at(line={fail_line}, col={fail_col}) for full goals")
 
     return "\n".join(lines)
 
