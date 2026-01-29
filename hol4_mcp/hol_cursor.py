@@ -20,16 +20,30 @@ from .hol_session import HOLSession, HOLDIR, escape_sml_string
 def _find_json_line(output: str, prefix: str = "") -> dict:
     """Find and parse a JSON line from HOL output.
 
-    Looks for lines starting with {"ok":...} or {"err":...}.
+    Looks for {"ok":...} or {"err":...} patterns, either at the start of a line
+    or embedded after other output (e.g., "metis: {"ok":...}").
     If prefix is provided, only looks for lines after that prefix.
     """
     for line in output.split('\n'):
         line = line.strip()
+        # First try exact line match (most common case)
         if line.startswith('{"ok":') or line.startswith('{"err":'):
             try:
                 return json.loads(line)
             except json.JSONDecodeError:
-                continue
+                pass
+        # Then try to find embedded JSON (e.g., after metis progress output)
+        # Look for {"ok": or {"err": anywhere in line
+        for marker in ['{"ok":', '{"err":']:
+            idx = line.find(marker)
+            if idx >= 0:
+                # Try to parse JSON starting from this position
+                candidate = line[idx:]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    # JSON might be truncated or malformed, continue
+                    pass
     return {}
 
 
@@ -1303,12 +1317,17 @@ class FileProofCursor:
 
             results[thm.name] = trace
 
-            # Store the theorem (QED) so later proofs can use it
+            # Store the theorem so later proofs can use it
             # Only if proof completed successfully (no error AND no remaining goals)
+            # NOTE: QED is syntax, not a function - use save_thm in REPL context
             final_entry = trace[-1] if trace else None
             proof_ok = final_entry and final_entry.goals_after == 0 and not final_entry.error
             if proof_ok:
-                await self.session.send('QED;', timeout=30)
+                # save_thm stores to DB and returns theorem; bind to name for REPL access
+                await self.session.send(
+                    f'val {thm.name} = save_thm("{thm.name}", top_thm());',
+                    timeout=30
+                )
             else:
                 # Proof incomplete - drop and skip storing
                 await self.session.send('drop_all();', timeout=5)
