@@ -9,3 +9,4 @@ build/
 .agent-files.git/
 node_modules/
 uv.lock
+.sandbox
