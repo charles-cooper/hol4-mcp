@@ -183,7 +183,7 @@ async def hol_sessions() -> str:
 
 
 @mcp.tool()
-async def hol_send(session: str, command: str, timeout: int = 5, max_output: int = DEFAULT_MAX_OUTPUT) -> str:
+async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX_OUTPUT, session: str = "default") -> str:
     """Send raw SML command to HOL session.
 
     WARNING: Do NOT use for proof navigation - use hol_state_at instead.
@@ -197,8 +197,8 @@ async def hol_send(session: str, command: str, timeout: int = 5, max_output: int
       - Debugging session state
 
     Args:
-        session: Session name
         command: SML command to execute
+        session: Session name (default: "default")
         timeout: Max seconds to wait (default 5, max 600)
         max_output: Max bytes of output to return (default 4096).
                     Shows tail when truncated (errors/results come after echoed input).
@@ -224,11 +224,11 @@ async def hol_send(session: str, command: str, timeout: int = 5, max_output: int
 
 
 @mcp.tool()
-async def hol_interrupt(session: str) -> str:
+async def hol_interrupt(session: str = "default") -> str:
     """Send SIGINT to abort runaway tactic.
 
     Args:
-        session: Session name from hol_start
+        session: Session name (default: "default")
 
     Returns: Confirmation message
     """
@@ -251,11 +251,11 @@ async def hol_interrupt(session: str) -> str:
 
 
 @mcp.tool()
-async def hol_stop(session: str) -> str:
+async def hol_stop(session: str = "default") -> str:
     """Terminate HOL session.
 
     Args:
-        session: Session name from hol_start
+        session: Session name (default: "default")
 
     Returns: Confirmation message
     """
@@ -267,7 +267,7 @@ async def hol_stop(session: str) -> str:
 
 
 @mcp.tool()
-async def hol_restart(session: str) -> str:
+async def hol_restart(session: str = "default") -> str:
     """Restart HOL session (stop + start, preserves workdir).
 
     Only needed when:
@@ -292,17 +292,17 @@ async def hol_restart(session: str) -> str:
 
 
 @mcp.tool()
-async def hol_setenv(session: str, env: dict) -> str:
+async def hol_setenv(env: dict, session: str = "default") -> str:
     """Set environment variables for a HOL session.
 
     These are passed to the HOL process and affect Holmakefile INCLUDES expansion.
     Use before hol_state_at or call hol_restart after to apply.
 
-    Example: hol_setenv("main", {"VFMDIR": "/home/user/verifereum"})
+    Example: hol_setenv({"VFMDIR": "/home/user/verifereum"})
 
     Args:
-        session: Session name
         env: Environment variables to set (merged with existing)
+        session: Session name (default: "default")
 
     Returns: Confirmation message
     """
@@ -665,12 +665,12 @@ async def _init_file_cursor(
 
 @mcp.tool()
 async def hol_state_at(
-    session: str,
     line: int,
     col: int = 1,
     file: str = None,
     workdir: str = None,
     max_output: int = DEFAULT_MAX_OUTPUT,
+    session: str = "default",
 ) -> str:
     """Get proof state at a file position.
 
@@ -678,12 +678,12 @@ async def hol_state_at(
     the given position, then shows current goals. Auto-enters theorem if needed.
 
     Args:
-        session: Session name
         line: 1-indexed line number (position in the proof)
         col: 1-indexed column number (default 1)
         file: Path to .sml file (auto-inits cursor if no cursor exists)
         workdir: Working directory for HOL (used with file)
         max_output: Max bytes of output (default 1000)
+        session: Session name (default: "default")
 
     Returns: Tactic position (N/M), goals at that position, errors if any
     """
@@ -787,10 +787,10 @@ async def hol_state_at(
 
 @mcp.tool()
 async def hol_check_proof(
-    session: str,
     theorem: str,
     file: str = None,
     workdir: str = None,
+    session: str = "default",
 ) -> str:
     """Check if a theorem's proof completes after editing.
 
@@ -798,10 +798,10 @@ async def hol_check_proof(
     hol_state_at with line numbers which may be stale after edits.
 
     Args:
-        session: Session name
         theorem: Theorem name to check
         file: Path to .sml file (auto-inits cursor if no cursor exists)
         workdir: Working directory for HOL (used with file)
+        session: Session name (default: "default")
 
     Returns: Whether proof completes, failure location, brief goal summary
     """
@@ -913,14 +913,14 @@ async def hol_check_proof(
 
 
 @mcp.tool()
-async def hol_file_status(session: str, file: str = None, workdir: str = None, timing: bool = True) -> str:
+async def hol_file_status(file: str = None, workdir: str = None, timing: bool = True, session: str = "default") -> str:
     """Get current cursor position and file status.
 
     Args:
-        session: Session name
         file: Path to .sml file (auto-inits cursor if no cursor exists)
         workdir: Working directory for HOL (used with file)
         timing: If True, run all proofs and report timing (slower)
+        session: Session name (default: "default")
 
     Returns: File info, active theorem, theorems with cheats, completion status
     """
@@ -1052,10 +1052,10 @@ async def hol_file_status(session: str, file: str = None, workdir: str = None, t
 
 @mcp.tool()
 async def hol_trace_proof(
-    session: str,
     theorem: str,
     file: str = None,
     workdir: str = None,
+    session: str = "default",
 ) -> str:
     """Execute a proof and return full timing trace.
 
@@ -1063,10 +1063,10 @@ async def hol_trace_proof(
     for each step.
 
     Args:
-        session: Session name
         theorem: Theorem name to trace
         file: Path to .sml file (auto-inits cursor if no cursor exists)
         workdir: Working directory for HOL (used with file)
+        session: Session name (default: "default")
 
     Returns: Full trace with timing for each tactic
     """
