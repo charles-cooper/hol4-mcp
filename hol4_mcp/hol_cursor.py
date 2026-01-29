@@ -1216,3 +1216,87 @@ class FileProofCursor:
         if not clean:
             self._proof_traces[theorem_name] = trace
         return trace
+
+    async def verify_all_proofs(self) -> dict[str, list[TraceEntry]]:
+        """Verify all proofs in clean state, processing in file order.
+
+        Executes each proof exactly once: times tactics, then stores theorem
+        so subsequent proofs can use it.
+
+        Returns:
+            Dict mapping theorem name to trace (empty list for cheats/no tactics)
+        """
+        results: dict[str, list[TraceEntry]] = {}
+
+        # Restore to clean deps-only state
+        if self._deps_checkpoint_saved:
+            await self._restore_to_deps()
+
+        content_lines = self._content.split('\n')
+        current_line = 0
+
+        for thm in self._theorems:
+            # Load content between previous theorem and this one (definitions, etc.)
+            if thm.start_line > current_line + 1:
+                pre_content = '\n'.join(content_lines[current_line:thm.start_line - 1])
+                if pre_content.strip():
+                    await self.session.send(pre_content, timeout=60)
+
+            if thm.has_cheat:
+                # Load cheat theorem as-is (stores it with cheat)
+                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line])
+                if thm_content.strip():
+                    await self.session.send(thm_content, timeout=60)
+                results[thm.name] = []
+                current_line = thm.proof_end_line
+                continue
+
+            # Parse step plan
+            if thm.proof_body:
+                escaped_body = escape_sml_string(thm.proof_body)
+                step_result = await self.session.send(
+                    f'step_plan_json "{escaped_body}";', timeout=30
+                )
+                try:
+                    step_plan = parse_step_plan_output(step_result)
+                except HOLParseError:
+                    step_plan = []
+            else:
+                step_plan = []
+
+            if not step_plan:
+                # No tactics - load theorem as-is
+                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line])
+                if thm_content.strip():
+                    await self.session.send(thm_content, timeout=60)
+                results[thm.name] = []
+                current_line = thm.proof_end_line
+                continue
+
+            # Set up goal
+            await self.session.send('drop_all();', timeout=5)
+            goal = thm.goal.replace('\n', ' ').strip()
+            await self.session.send(f'g `{goal}`;', timeout=30)
+
+            # Execute tactics with timing
+            trace = []
+            for step in step_plan:
+                if step.cmd.strip():
+                    entry = await self._timed_step(step.cmd)
+                    trace.append(entry)
+                    if entry.error:
+                        break
+
+            results[thm.name] = trace
+
+            # Store the theorem (QED) so later proofs can use it
+            final_goals = trace[-1].goals_after if trace else -1
+            if final_goals == 0:
+                await self.session.send('QED;', timeout=30)
+            else:
+                # Proof incomplete - drop and skip storing
+                await self.session.send('drop_all();', timeout=5)
+
+            current_line = thm.proof_end_line
+
+        return results

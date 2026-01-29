@@ -788,7 +788,10 @@ async def hol_file_status(session: str, file: str = None, workdir: str = None, t
 
     # When timing, we verify proofs by execution; otherwise use static analysis
     if timing:
-        # Run proofs and track actual success/failure
+        # Run all proofs in clean state (efficient batch verification)
+        all_traces = await cursor.verify_all_proofs()
+
+        # Process results
         verified = []
         failed = []  # (name, error_msg)
         cheated = []
@@ -796,30 +799,29 @@ async def hol_file_status(session: str, file: str = None, workdir: str = None, t
         total_ms = 0
 
         for thm in status['theorems']:
+            trace = all_traces.get(thm['name'], [])
             if thm['has_cheat']:
                 cheated.append(thm['name'])
                 timing_lines.append(f"  {thm['name']}: (cheat)")
-            else:
-                trace = await cursor.execute_proof_traced(thm['name'], clean=True)
-                if trace:
-                    thm_ms = sum(e.real_ms for e in trace)
-                    total_ms += thm_ms
-                    error = next((e.error for e in trace if e.error), None)
-                    # Check proof actually completed (no remaining goals)
-                    final_goals = trace[-1].goals_after if trace else -1
-                    if error:
-                        failed.append((thm['name'], error))
-                        timing_lines.append(f"  {thm['name']}: {thm_ms}ms (ERROR: {error})")
-                    elif final_goals != 0:
-                        failed.append((thm['name'], f"incomplete ({final_goals} goals remain)"))
-                        timing_lines.append(f"  {thm['name']}: {thm_ms}ms (INCOMPLETE: {final_goals} goals)")
-                    else:
-                        verified.append(thm['name'])
-                        timing_lines.append(f"  {thm['name']}: {thm_ms}ms")
+            elif trace:
+                thm_ms = sum(e.real_ms for e in trace)
+                total_ms += thm_ms
+                error = next((e.error for e in trace if e.error), None)
+                # Check proof actually completed (no remaining goals)
+                final_goals = trace[-1].goals_after if trace else -1
+                if error:
+                    failed.append((thm['name'], error))
+                    timing_lines.append(f"  {thm['name']}: {thm_ms}ms (ERROR: {error})")
+                elif final_goals != 0:
+                    failed.append((thm['name'], f"incomplete ({final_goals} goals remain)"))
+                    timing_lines.append(f"  {thm['name']}: {thm_ms}ms (INCOMPLETE: {final_goals} goals)")
                 else:
-                    timing_lines.append(f"  {thm['name']}: (no tactics)")
-                    # No tactics = likely just goal statement, count as incomplete
-                    failed.append((thm['name'], "no tactics"))
+                    verified.append(thm['name'])
+                    timing_lines.append(f"  {thm['name']}: {thm_ms}ms")
+            else:
+                timing_lines.append(f"  {thm['name']}: (no tactics)")
+                # No tactics = likely just goal statement, count as incomplete
+                failed.append((thm['name'], "no tactics"))
 
         lines = [
             f"File: {status['file']}",
