@@ -1231,6 +1231,20 @@ class FileProofCursor:
         # Restore to clean deps-only state
         if self._deps_checkpoint_saved:
             await self._restore_to_deps()
+        else:
+            # No checkpoint - must reload deps manually for clean state
+            # This is slower but ensures correctness
+            if self.session.is_running:
+                await self.session.stop()
+            await self.session.start()
+            try:
+                deps = await get_script_dependencies(self.file)
+                for dep in deps:
+                    result = await self.session.send(f'load "{dep}";', timeout=60)
+                    if _is_hol_error(result) and "Cannot find file" not in result:
+                        break  # Stop on real errors
+            except FileNotFoundError:
+                pass  # holdeptool not available
 
         content_lines = self._content.split('\n')
         current_line = 0
