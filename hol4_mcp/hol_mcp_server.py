@@ -863,16 +863,16 @@ async def hol_check_proof(
         return thm.proof_start_line
 
     final = trace[-1]
+    total_ms = sum(e.real_ms for e in trace)
     
     if final.error:
-        lines.append(f"Status: FAILED at line {tactic_line(failed_idx)}")
+        lines.append(f"Status: FAILED at line {tactic_line(failed_idx)} ({total_ms}ms)")
         lines.append(f"Error: {final.error}")
     elif final.goals_after == 0:
-        total_ms = sum(e.real_ms for e in trace)
         lines.append(f"Status: OK ({total_ms}ms)")
         return "\n".join(lines)
     else:
-        lines.append(f"Status: INCOMPLETE at line {tactic_line(len(trace) - 1)}")
+        lines.append(f"Status: INCOMPLETE at line {tactic_line(len(trace) - 1)} ({total_ms}ms)")
 
     # Get goals at failure point
     lines.append("")

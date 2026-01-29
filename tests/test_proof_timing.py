@@ -101,27 +101,28 @@ QED
 
 @pytest.mark.asyncio
 async def test_timed_step_timeout(hol_session: HOLSession, tmp_path: Path):
-    """Test that timeout reports correct duration in TraceEntry."""
+    """Test that per-tactic timeout works in SML."""
     script = tmp_path / "testScript.sml"
+    # Tactic that sleeps - guarantees timeout and yields to interrupt
     script.write_text("""
-Theorem test_trivial:
+Theorem test_slow:
   T
 Proof
-  rw[]
+  (fn g => (OS.Process.sleep (Time.fromReal 5.0); ALL_TAC g))
 QED
 """)
 
-    # Use tiny timeout so any tactic times out
-    timeout_sec = 0.001
+    timeout_sec = 0.5
     cursor = FileProofCursor(script, hol_session, tactic_timeout=timeout_sec)
     await cursor.init()
 
-    trace = await cursor.execute_proof_traced("test_trivial")
+    trace = await cursor.execute_proof_traced("test_slow")
     assert len(trace) >= 1
 
     entry = trace[0]
     assert entry.error == "TIMEOUT"
-    assert entry.real_ms == int(timeout_sec * 1000)  # Should be 1ms
+    # real_ms should be approximately the timeout value (within 200ms tolerance)
+    assert abs(entry.real_ms - int(timeout_sec * 1000)) < 200
 
 
 if __name__ == "__main__":

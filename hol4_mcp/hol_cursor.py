@@ -1147,18 +1147,18 @@ class FileProofCursor:
     # =========================================================================
 
     async def _timed_step(self, cmd: str) -> TraceEntry:
-        """Execute a command and return timing. Internal helper."""
+        """Execute a single tactic with timing. Supports per-tactic timeout."""
         timeout = self._tactic_timeout or 60
         escaped_cmd = escape_sml_string(cmd)
         output = await self.session.send(
             f'timed_step_json "{escaped_cmd}";', timeout=timeout
         )
-        
+
         # Check for timeout - report actual timeout duration
         if output.startswith("TIMEOUT"):
             return TraceEntry(cmd=cmd, real_ms=int(timeout * 1000), usr_ms=0, sys_ms=0,
                             goals_before=0, goals_after=0, error="TIMEOUT")
-        
+
         result = _find_json_line(output)
         if 'err' in result:
             return TraceEntry(cmd=cmd, real_ms=0, usr_ms=0, sys_ms=0,
@@ -1166,7 +1166,7 @@ class FileProofCursor:
         if 'ok' not in result:
             return TraceEntry(cmd=cmd, real_ms=0, usr_ms=0, sys_ms=0,
                             goals_before=0, goals_after=0, error="No response")
-        
+
         data = result['ok']
         return TraceEntry(
             cmd=cmd,
@@ -1211,20 +1211,43 @@ class FileProofCursor:
             if "error" in enter_result:
                 return []
 
-        # Set up goal
-        await self.session.send('drop_all();', timeout=5)
-        goal = thm.goal.replace('\n', ' ').strip()
-        await self.session.send(f'g `{goal}`;', timeout=30)
+        # Get tactics from step plan
+        tactics = [step.cmd for step in self._step_plan if step.cmd.strip()]
+        if not tactics:
+            return []
 
-        # Execute each step with timing
+        # Single batched call with store=false (trace only, don't commit)
+        goal = thm.goal.replace('\n', ' ').strip()
+        tactics_sml = "[" + ",".join(
+            f'"{escape_sml_string(t)}"' for t in tactics
+        ) + "]"
+        tactic_timeout = self._tactic_timeout or 60.0
+        # Python timeout = per-tactic timeout * num tactics + buffer
+        python_timeout = tactic_timeout * len(tactics) + 10
+        result = await self.session.send(
+            f'verify_theorem_json "{escape_sml_string(goal)}" "{theorem_name}" {tactics_sml} false {tactic_timeout:.1f};',
+            timeout=max(30, python_timeout)
+        )
+
+        # Parse response into TraceEntry list
+        parsed = _find_json_line(result)
         trace = []
-        for step in self._step_plan:
-            if step.cmd.strip():
-                entry = await self._timed_step(step.cmd)
-                trace.append(entry)
-                # Stop on error - subsequent tactics won't work
-                if entry.error:
-                    break
+        if 'ok' in parsed:
+            for i, entry in enumerate(parsed['ok'].get('trace', [])):
+                cmd = tactics[i] if i < len(tactics) else ""
+                trace.append(TraceEntry(
+                    cmd=cmd,
+                    real_ms=entry.get('real_ms', 0),
+                    usr_ms=0, sys_ms=0,
+                    goals_before=entry.get('goals_before', 0),
+                    goals_after=entry.get('goals_after', 0),
+                    error=entry.get('err')
+                ))
+        elif 'err' in parsed:
+            trace.append(TraceEntry(
+                cmd="", real_ms=0, usr_ms=0, sys_ms=0,
+                goals_before=0, goals_after=0, error=parsed['err']
+            ))
 
         # Cache the result (only for non-clean runs to avoid polluting cache)
         if not clean:
@@ -1301,37 +1324,46 @@ class FileProofCursor:
                 current_line = thm.proof_end_line - 1  # 0-indexed: next line to load
                 continue
 
-            # Set up goal
-            await self.session.send('drop_all();', timeout=5)
+            # Batch verify entire theorem in one IPC call
             goal = thm.goal.replace('\n', ' ').strip()
-            await self.session.send(f'g `{goal}`;', timeout=30)
+            tactics = [step.cmd for step in step_plan if step.cmd.strip()]
 
-            # Execute tactics with timing
+            # Build SML list literal: ["tac1", "tac2", ...]
+            tactics_sml = "[" + ",".join(
+                f'"{escape_sml_string(t)}"' for t in tactics
+            ) + "]"
+
+            # Single call: sets goal, runs tactics with timing, stores if OK
+            # SML handles per-tactic timeout; Python timeout is buffer
+            tactic_timeout = self._tactic_timeout or 60.0
+            python_timeout = tactic_timeout * len(tactics) + 10
+            result = await self.session.send(
+                f'verify_theorem_json "{escape_sml_string(goal)}" "{thm.name}" {tactics_sml} true {tactic_timeout:.1f};',
+                timeout=max(30, python_timeout)
+            )
+
+            # Parse response and convert to TraceEntry list
+            parsed = _find_json_line(result)
             trace = []
-            for step in step_plan:
-                if step.cmd.strip():
-                    entry = await self._timed_step(step.cmd)
-                    trace.append(entry)
-                    if entry.error:
-                        break
+            if 'ok' in parsed:
+                for i, entry in enumerate(parsed['ok'].get('trace', [])):
+                    cmd = tactics[i] if i < len(tactics) else ""
+                    trace.append(TraceEntry(
+                        cmd=cmd,
+                        real_ms=entry.get('real_ms', 0),
+                        usr_ms=0, sys_ms=0,
+                        goals_before=entry.get('goals_before', 0),
+                        goals_after=entry.get('goals_after', 0),
+                        error=entry.get('err')
+                    ))
+            elif 'err' in parsed:
+                # Goal setup failed - record single error entry
+                trace.append(TraceEntry(
+                    cmd="", real_ms=0, usr_ms=0, sys_ms=0,
+                    goals_before=0, goals_after=0, error=parsed['err']
+                ))
 
             results[thm.name] = trace
-
-            # Store the theorem so later proofs can use it
-            # Only if proof completed successfully (no error AND no remaining goals)
-            # NOTE: QED is syntax, not a function - use save_thm in REPL context
-            final_entry = trace[-1] if trace else None
-            proof_ok = final_entry and final_entry.goals_after == 0 and not final_entry.error
-            if proof_ok:
-                # save_thm stores to DB and returns theorem; bind to name for REPL access
-                await self.session.send(
-                    f'val {thm.name} = save_thm("{thm.name}", top_thm());',
-                    timeout=30
-                )
-            else:
-                # Proof incomplete - drop and skip storing
-                await self.session.send('drop_all();', timeout=5)
-
             current_line = thm.proof_end_line - 1  # 0-indexed: next line to load
 
         return results

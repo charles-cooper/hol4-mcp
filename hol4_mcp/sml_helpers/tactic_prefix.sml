@@ -493,3 +493,64 @@ fun timed_step_json cmd =
       ",\"goals_after\":" ^ Int.toString goals_after ^ "}") ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* verify_theorem_json: Execute entire proof with timing, optionally store.
+   Args: goal (string), name (string), tactics (string list), store (bool), timeout_sec (real)
+   Output: {"ok":{"stored":true/false,"name":"...",
+            "trace":[{"real_ms":N,"goals_before":N,"goals_after":N}, ...]}}
+   Does: drop_all -> g goal -> run tactics with timing -> save_thm if OK and store=true *)
+fun verify_theorem_json goal name tactics store timeout_sec =
+  let
+    val _ = drop_all ()
+    val _ = smlExecute.quse_string ("g `" ^ goal ^ "`;")
+
+    (* Run single tactic with timeout, return JSON entry *)
+    fun run_one cmd =
+      let
+        val goals_before = length (top_goals()) handle _ => 0
+        val start = Timer.startRealTimer()
+        val _ = smlTimeout.timeout timeout_sec (fn () => smlExecute.quse_string cmd) ()
+        val real_ms = Time.toMilliseconds (Timer.checkRealTimer start)
+        val goals_after = length (top_goals()) handle _ => 0
+      in
+        (SOME ("{\"real_ms\":" ^ LargeInt.toString real_ms ^
+               ",\"goals_before\":" ^ Int.toString goals_before ^
+               ",\"goals_after\":" ^ Int.toString goals_after ^ "}"), true)
+      end
+      handle smlTimeout.FunctionTimeout =>
+        let val timeout_ms = Real.round (timeout_sec * 1000.0) in
+        (SOME ("{\"err\":\"TIMEOUT\"" ^
+               ",\"real_ms\":" ^ Int.toString timeout_ms ^
+               ",\"goals_before\":" ^ Int.toString (length (top_goals()) handle _ => 0) ^ "}"), false)
+        end
+      | e =>
+        (SOME ("{\"err\":" ^ json_string (exnMessage e) ^
+               ",\"goals_before\":" ^ Int.toString (length (top_goals()) handle _ => 0) ^ "}"), false)
+
+    (* Run all tactics, stop on error *)
+    fun run_all [] acc = rev acc
+      | run_all (cmd::rest) acc =
+          case run_one cmd of
+            (SOME entry, true) => run_all rest (entry::acc)
+          | (SOME entry, false) => rev (entry::acc)  (* error - stop *)
+          | (NONE, _) => rev acc
+
+    val trace_entries = run_all tactics []
+    (* When proof complete, top_goals() raises - treat as 0 goals remaining *)
+    val goals_remaining = length (top_goals()) handle _ => 0
+    val proof_ok = goals_remaining = 0
+
+    (* Store if successful and requested - bind to val so later proofs can use it *)
+    val stored = proof_ok andalso store
+    val _ = if stored
+            then (smlExecute.quse_string ("val " ^ name ^ " = save_thm(\"" ^ name ^ "\", top_thm());"); ())
+            else (drop_all (); ())
+
+    val trace_json = "[" ^ String.concatWith "," trace_entries ^ "]"
+  in
+    print (json_ok (
+      "{\"stored\":" ^ (if stored then "true" else "false") ^
+      ",\"name\":" ^ json_string name ^
+      ",\"trace\":" ^ trace_json ^ "}") ^ "\n")
+  end
+  handle e => print (json_err (exnMessage e) ^ "\n");
