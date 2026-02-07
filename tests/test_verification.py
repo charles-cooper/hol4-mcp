@@ -226,3 +226,56 @@ QED
     assert len(trace) > 0
     assert trace[-1].goals_after == 0
     assert trace[-1].error is None
+
+
+@pytest.mark.asyncio
+async def test_loads_content_immediately_after_qed(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Regression: val bindings and Definitions on lines right after QED must be loaded.
+
+    _load_remaining_content and _load_context_to_line had an off-by-one that
+    skipped lines immediately following each theorem's QED.
+
+    Tests both "before first theorem" and "between theorems" positions for both
+    val bindings and Definition blocks.
+    """
+    script = tmp_path / "testScript.sml"
+    script.write_text("""\
+val pre_val = TRUTH;
+Definition pre_def:
+  pre_const = T
+End
+Theorem first_thm:
+  pre_const
+Proof
+  simp[pre_def]
+QED
+val post_val = TRUTH;
+Definition post_def:
+  post_const = T
+End
+Theorem uses_post_qed_content:
+  post_const
+Proof
+  simp[post_def]
+QED
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    # state_at on the second theorem should work (needs post_def loaded via init)
+    result = await cursor.state_at(line=17, col=1)
+    assert result.error is None, f"state_at failed: {result.error}"
+
+    # verify_all_proofs should also succeed for both theorems
+    results = await cursor.verify_all_proofs()
+
+    trace1 = results["first_thm"]
+    assert len(trace1) > 0
+    assert trace1[-1].goals_after == 0, "first_thm proof failed (pre-theorem content not loaded)"
+    assert trace1[-1].error is None
+
+    trace2 = results["uses_post_qed_content"]
+    assert len(trace2) > 0
+    assert trace2[-1].goals_after == 0, "post-QED content not loaded (Definition/val after QED skipped)"
+    assert trace2[-1].error is None

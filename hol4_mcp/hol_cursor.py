@@ -709,7 +709,9 @@ class FileProofCursor:
         for thm in remaining_thms:
             # Load any content between current position and theorem start
             if thm.start_line > self._loaded_to_line:
-                to_load = '\n'.join(content_lines[self._loaded_to_line:thm.start_line - 1])
+                # _loaded_to_line is 1-indexed (first unloaded line), convert to 0-index
+                start_idx = self._loaded_to_line - 1 if self._loaded_to_line > 0 else 0
+                to_load = '\n'.join(content_lines[start_idx:thm.start_line - 1])
                 if to_load.strip():
                     await self.session.send(to_load, timeout=60)
                 self._loaded_to_line = thm.start_line
@@ -719,14 +721,16 @@ class FileProofCursor:
             if thm_content.strip():
                 # Ignore errors - proof failures are expected for broken cheat theorems
                 await self.session.send(thm_content, timeout=60)
-            self._loaded_to_line = thm.proof_end_line + 1
+            # proof_end_line is "line after QED" (1-indexed); we loaded through QED
+            self._loaded_to_line = thm.proof_end_line
         
         # Load any trailing content after last theorem
         last_thm = self._theorems[-1] if self._theorems else None
         if last_thm:
             total_lines = len(content_lines)
             if self._loaded_to_line <= total_lines:
-                trailing = '\n'.join(content_lines[self._loaded_to_line - 1:])
+                start_idx = self._loaded_to_line - 1 if self._loaded_to_line > 0 else 0
+                trailing = '\n'.join(content_lines[start_idx:])
                 if trailing.strip():
                     await self.session.send(trailing, timeout=60)
                 self._loaded_to_line = total_lines + 1
@@ -788,7 +792,8 @@ class FileProofCursor:
                     if check(result):
                         return f"Failed to load context: {_format_context_error(result)}"
                 
-                current_line = thm.proof_end_line + 1
+                # proof_end_line is "line after QED" (1-indexed); we loaded through QED
+                current_line = thm.proof_end_line
             
             # Load remaining content after last theorem (up to target_line)
             if current_line < target_line:
