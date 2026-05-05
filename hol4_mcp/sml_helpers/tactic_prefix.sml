@@ -494,12 +494,17 @@ fun extract_tc_goal_json body_str =
 
 fun resume_goal_terms suspension_name label_name =
   let
-    val th = case boolLib.find_suspension suspension_name of
-                 SOME th => th
-               | NONE => raise Fail ("No suspension found: " ^ suspension_name)
-    val goal_term = markerLib.extract_suspended_goal th label_name
+    val (parent_thy, th) =
+        case markerLib.lookup_suspension suspension_name of
+            SOME pair => pair
+          | NONE => raise Fail ("No suspension found: " ^ suspension_name)
+    val sths = markerLib.lookup_resumption
+                 {parent_thy = parent_thy,
+                  parent_name = suspension_name,
+                  label = label_name}
   in
-    markerLib.resumption_to_goal goal_term
+    markerLib.resumption_to_goal
+      (markerLib.extract_suspended_goal (th::sths) label_name)
   end
 
 fun extract_resume_goal_json suspension_name label_name =
