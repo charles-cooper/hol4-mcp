@@ -419,3 +419,124 @@ class TestGoalfragSelectGoalDecomposition:
             if step.kind == "expand":
                 assert not step.text.startswith("[`"), \
                     f"Bare pattern expand step found: {step.text}"
+
+
+# =============================================================================
+# Resume goal extraction
+#
+# Regression tests for a bug where `resume_goal_terms` referenced
+# `boolLib.find_suspension` (does not exist) instead of
+# `markerLib.lookup_suspension`, causing `extract_resume_goal_json` and
+# `verify_resume_json` to fail to compile. The downstream symptom was:
+#
+#     Failed to extract Resume goal for '<thm>[<label>]'; goals_json: NO_PROOFS
+#
+# These tests pin the SML-level entry points so the bug cannot regress
+# silently behind the higher-level cursor tests.
+# =============================================================================
+
+
+async def _setup_split_conj(session: HOLSession) -> None:
+    """Define a parent theorem with two suspended subgoals in the live session."""
+    await session.send('drop_all();', timeout=5)
+    parent = (
+        'Theorem split_conj:\n'
+        '  p /\\ (p ==> q) ==> p /\\ q\n'
+        'Proof\n'
+        '  strip_tac >> conj_tac\n'
+        '  >- suspend "p_case"\n'
+        '  >- suspend "q_case"\n'
+        'QED'
+    )
+    result = await session.send(parent, timeout=30)
+    assert "saved theorem" in result.lower() or "stashing" in result.lower(), (
+        f"Parent theorem did not register: {result[-500:]}"
+    )
+
+
+class TestResumeGoalExtraction:
+    """Direct SML tests for the Resume goal extraction helpers."""
+
+    async def test_extract_resume_goal_json_first_label(self, hol_session):
+        """extract_resume_goal_json returns the suspended subgoal as JSON."""
+        await _setup_split_conj(hol_session)
+        result = await hol_session.send(
+            'extract_resume_goal_json "split_conj" "p_case";', timeout=10
+        )
+        # Must have produced a JSON ok line (not an err, not a static error).
+        ok_line = None
+        for line in result.strip().split('\n'):
+            line = line.strip()
+            if line.startswith('{"ok":'):
+                ok_line = line
+                break
+        assert ok_line is not None, (
+            f"extract_resume_goal_json did not emit ok JSON. Output: {result!r}"
+        )
+        payload = json.loads(ok_line)['ok']
+        # The first suspended subgoal of split_conj is `p` (with `p ==> q` as asm
+        # added by `strip_tac`). extract_resume_goal_json prints types, so the
+        # term renders as e.g. "(p :bool)".
+        assert 'p' in payload['goal'] and 'bool' in payload['goal'], (
+            f"Unexpected goal text: {payload!r}"
+        )
+
+    async def test_extract_resume_goal_json_second_label(self, hol_session):
+        """Both suspended labels are independently extractable."""
+        await _setup_split_conj(hol_session)
+        result = await hol_session.send(
+            'extract_resume_goal_json "split_conj" "q_case";', timeout=10
+        )
+        ok_line = next(
+            (line.strip() for line in result.strip().split('\n')
+             if line.strip().startswith('{"ok":')),
+            None,
+        )
+        assert ok_line is not None, (
+            f"extract_resume_goal_json did not emit ok JSON. Output: {result!r}"
+        )
+        payload = json.loads(ok_line)['ok']
+        # Second subgoal is `q`; types are printed.
+        assert 'q' in payload['goal'] and 'bool' in payload['goal'], (
+            f"Unexpected goal text: {payload!r}"
+        )
+
+    async def test_extract_resume_goal_json_unknown_suspension(self, hol_session):
+        """Looking up a non-existent suspension reports an error, not a crash."""
+        await hol_session.send('drop_all();', timeout=5)
+        result = await hol_session.send(
+            'extract_resume_goal_json "no_such_thm" "no_label";', timeout=5
+        )
+        # Should produce a JSON err line — NOT a Poly/ML 'has not been declared'
+        # static error (which is the symptom of the original bug).
+        assert "has not been declared" not in result, (
+            f"resume_goal_terms failed to compile: {result!r}"
+        )
+        assert any(
+            line.strip().startswith('{"err":') for line in result.strip().split('\n')
+        ), f"Expected JSON err line; got: {result!r}"
+
+    async def test_verify_resume_json_closes_subgoal(self, hol_session):
+        """verify_resume_json runs Resume tactics against the suspended goal."""
+        await _setup_split_conj(hol_session)
+        # `ASM_REWRITE_TAC[]` closes `p` given `p` is in the asms (added by strip_tac).
+        cmd = (
+            'verify_resume_json "split_conj" "p_case" "split_conj_p_case" '
+            '["ef(goalFrag.expand(ASM_REWRITE_TAC[]))"] false 10.0;'
+        )
+        result = await hol_session.send(cmd, timeout=20)
+        ok_line = next(
+            (line.strip() for line in result.strip().split('\n')
+             if line.strip().startswith('{"ok":')),
+            None,
+        )
+        assert ok_line is not None, (
+            f"verify_resume_json did not emit ok JSON. Output: {result!r}"
+        )
+        payload = json.loads(ok_line)['ok']
+        trace = payload.get('trace', [])
+        assert trace, f"Empty trace from verify_resume_json: {payload!r}"
+        # Final tactic must close the goal (goals_after == 0).
+        assert trace[-1].get('goals_after') == 0, (
+            f"Resume tactics did not close goal: {trace!r}"
+        )
