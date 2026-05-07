@@ -272,16 +272,29 @@ fun merge_select_steps [] acc = rev acc
             | mkSelectPrefix (p :: ps) = "Q.SELECT_GOAL_LT " ^ p ^ " >>~ Q.SELECT_GOALS_LT " ^
                 String.concatWith " >>~ Q.SELECT_GOALS_LT " ps
           val selectPrefix = mkSelectPrefix sels
-          (* Try to consume the following bracket: open expand close *)
+          (* Try to consume the following bracket: open (expand)+ close.
+             The body may be a single expand (e.g. >- simp[]) or a compound
+             of expands joined by >> (e.g. >- (simp[] >> fs[])).
+             Bail (NONE) for nested brackets or unexpected fragment kinds —
+             those would need full source reconstruction. *)
+          fun isOpenArm "open_then1" = true
+            | isOpenArm "open_first" = true
+            | isOpenArm _ = false
+          fun walkArm [] _ _ = NONE
+            | walkArm ((endP, "close", _) :: rest') texts lastEnd =
+                (case rev texts of
+                   [] => NONE
+                 | [single] => SOME (selectPrefix ^ " >- " ^ single, lastEnd, rest')
+                 | many => SOME (
+                     selectPrefix ^ " >- (" ^
+                     String.concatWith " >> " many ^ ")",
+                     lastEnd, rest'))
+            | walkArm ((endP, "expand", t) :: rest') texts _ =
+                walkArm rest' (t :: texts) endP
+            | walkArm _ _ _ = NONE  (* nested open/mid: bail *)
           fun tryConsumeBracket [] = NONE
-            | tryConsumeBracket ((_, "open", "open_then1") ::
-                                (tacEnd, "expand", tacText) ::
-                                (_, "close", _) :: rest') =
-                SOME (selectPrefix ^ " >- " ^ tacText, tacEnd, rest')
-            | tryConsumeBracket ((_, "open", "open_first") ::
-                                (tacEnd, "expand", tacText) ::
-                                (_, "close", _) :: rest') =
-                SOME (selectPrefix ^ " >- " ^ tacText, tacEnd, rest')
+            | tryConsumeBracket ((_, "open", openName) :: rest') =
+                if isOpenArm openName then walkArm rest' [] 0 else NONE
             | tryConsumeBracket _ = NONE
         in
           case tryConsumeBracket afterSels of

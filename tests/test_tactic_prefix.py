@@ -420,6 +420,53 @@ class TestGoalfragSelectGoalDecomposition:
                 assert not step.text.startswith("[`"), \
                     f"Bare pattern expand step found: {step.text}"
 
+    async def test_select_goal_compound_body_then(self, hol_session):
+        """>~[pat] >- (a >> b): compound body must be merged, not silently dropped.
+
+        Regression: previously the SELECT_GOAL_LT prefix was dropped when the
+        `>-` body had multiple tactics joined by `>>` (the bracket pattern
+        match in tryConsumeBracket was open+single_expand+close). With the
+        prefix dropped, the `>~` selector never executed and `>-` ran on the
+        un-reordered goal stack, picking the wrong goal."""
+        result = await call_step_plan(hol_session, "Cases_on `x` >~ [`Foo`] >- (simp[] >> fs[])")
+        # Must produce: expand(Cases_on), expand_list(Q.SELECT_GOAL_LT [`Foo`] >- (simp[] >> fs[]))
+        assert len(result) == 2, f"Expected 2 steps, got {len(result)}: {[(s.kind, s.text) for s in result]}"
+        assert result[0].kind == "expand"
+        assert result[1].kind == "expand_list", \
+            f"Compound body should yield expand_list step, got kind={result[1].kind} text={result[1].text!r}"
+        assert "Q.SELECT_GOAL_LT" in result[1].text
+        assert "`Foo`" in result[1].text
+        assert "simp[]" in result[1].text
+        assert "fs[]" in result[1].text
+
+    async def test_select_goal_compound_body_three_then(self, hol_session):
+        """>~[pat] >- (a >> b >> c): three-tactic compound body."""
+        result = await call_step_plan(hol_session, "Cases_on `x` >~ [`Foo`] >- (a >> b >> c)")
+        assert len(result) == 2
+        assert result[1].kind == "expand_list"
+        assert "Q.SELECT_GOAL_LT" in result[1].text
+        # All three sub-tactics must be present
+        for tac in ("a", "b", "c"):
+            assert tac in result[1].text
+
+    async def test_select_goal_compound_body_associativity(self, hol_session):
+        """Compound body must parenthesize so `>-` doesn't bind only to first sub-tactic.
+
+        `Q.SELECT_GOAL_LT [pat] >- a >> b` parses as
+          `(Q.SELECT_GOAL_LT [pat] >- a) >> b`
+        which would run `b` on goals OUTSIDE the >- arm. The body must be
+        wrapped in parens so the entire compound is the arm body."""
+        result = await call_step_plan(hol_session, "Cases_on `x` >~ [`Foo`] >- (simp[] >> fs[])")
+        # The combined text must keep simp[] >> fs[] grouped (parens, or some
+        # equivalent that prevents `>-` from binding only to simp[]).
+        text = result[1].text
+        # Find the position of `>-` and check what follows is parenthesized
+        dash_idx = text.find(">-")
+        assert dash_idx >= 0
+        body = text[dash_idx + 2:].lstrip()
+        assert body.startswith("("), \
+            f"Compound body must be parenthesized; got {body!r}"
+
 
 # =============================================================================
 # Resume goal extraction
