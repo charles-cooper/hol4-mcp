@@ -218,11 +218,19 @@ fun reexpand_group_atoms frags =
     (* Only re-expand Group atoms containing compound expressions (Then, ThenLT, etc.)
        that produce useful navigable sub-steps. Single-step wrappers like Repeat,
        Try, LNullOk etc. should stay atomic — their open/close structure adds
-       navigation overhead without useful intermediate goal states. *)
+       navigation overhead without useful intermediate goal states.
+       ThenLT whose list-tactic argument contains LReverse / LTacsToLT / other
+       structural-only LT-elements MUST stay opaque — re-expanding produces
+       FAtoms (LReverse, etc.) that have no span, get empty text from
+       frag_text, and are silently dropped by assignEnds, which would lose
+       e.g. the `reverse` in `reverse TOP_CASE_TAC`. *)
+    fun ltElemIsStructuralOnly TacticParse.LReverse = true
+      | ltElemIsStructuralOnly _ = false
+    fun lsHasStructuralOnly ls = List.exists ltElemIsStructuralOnly ls
     fun isComposable (TacticParse.Then _) = true
-      | isComposable (TacticParse.ThenLT _) = true
+      | isComposable (TacticParse.ThenLT (_, ls)) = not (lsHasStructuralOnly ls)
       | isComposable (TacticParse.LThen1 _) = true
-      | isComposable (TacticParse.LThenLT _) = true
+      | isComposable (TacticParse.LThenLT ls) = not (lsHasStructuralOnly ls)
       | isComposable (TacticParse.Group _) = true  (* peels outer wrapper; inner expr is checked by recursion *)
       | isComposable _ = false
     fun isGroupAtom (TacticParse.FAtom (TacticParse.Group (_, _, e))) =
@@ -272,29 +280,68 @@ fun merge_select_steps [] acc = rev acc
             | mkSelectPrefix (p :: ps) = "Q.SELECT_GOAL_LT " ^ p ^ " >>~ Q.SELECT_GOALS_LT " ^
                 String.concatWith " >>~ Q.SELECT_GOALS_LT " ps
           val selectPrefix = mkSelectPrefix sels
-          (* Try to consume the following bracket: open (expand)+ close.
-             The body may be a single expand (e.g. >- simp[]) or a compound
-             of expands joined by >> (e.g. >- (simp[] >> fs[])).
-             Bail (NONE) for nested brackets or unexpected fragment kinds —
-             those would need full source reconstruction. *)
+          (* Try to consume the following bracket: open (expand|nested)+ close.
+             The body may be a single expand, a compound of expands joined by
+             >>, or contain NESTED >- / parens. parseBody recursively
+             reconstructs the body text, parenthesising nested >- groups so
+             the precedence ((tac >- body) vs surrounding >>) is preserved.
+             Bails on unsupported open kinds (>|, >~ inside, etc). *)
           fun isOpenArm "open_then1" = true
             | isOpenArm "open_first" = true
             | isOpenArm _ = false
-          fun walkArm [] _ _ = NONE
-            | walkArm ((endP, "close", _) :: rest') texts lastEnd =
-                (case rev texts of
+          (* parseBody: walk steps until matching close at depth 0, returning
+             (combined-text, close-end-offset, remaining-steps). On nested
+             open_then1, the previous atom in acc is wrapped:
+                 last  +  open_then1  +  innerBody  +  close
+                  -> "(" ^ last ^ " >- (" ^ innerBody ^ "))"
+             so subsequent >> joins don't accidentally bind to the THEN1. *)
+          fun parseBody [] _ = NONE  (* unbalanced *)
+            | parseBody ((closeEnd, "close", _) :: rest) acc =
+                (case rev acc of
                    [] => NONE
-                 | [single] => SOME (selectPrefix ^ " >- " ^ single, lastEnd, rest')
-                 | many => SOME (
-                     selectPrefix ^ " >- (" ^
-                     String.concatWith " >> " many ^ ")",
-                     lastEnd, rest'))
-            | walkArm ((endP, "expand", t) :: rest') texts _ =
-                walkArm rest' (t :: texts) endP
-            | walkArm _ _ _ = NONE  (* nested open/mid: bail *)
+                 | xs => SOME (String.concatWith " >> " xs, closeEnd, rest))
+            | parseBody ((_, "open", "open_then1") :: rest) acc =
+                (case parseBody rest [] of
+                   NONE => NONE
+                 | SOME (innerText, _, rest') =>
+                     (case acc of
+                        [] => NONE  (* >- with no preceding atom *)
+                      | last :: restAcc =>
+                          parseBody rest'
+                            (("(" ^ last ^ " >- (" ^ innerText ^ "))") :: restAcc)))
+            | parseBody ((_, "open", "open_paren") :: rest) acc =
+                (case parseBody rest [] of
+                   NONE => NONE
+                 | SOME (innerText, _, rest') =>
+                     parseBody rest' (("(" ^ innerText ^ ")") :: acc))
+            | parseBody ((_, "open", _) :: _) _ = NONE  (* other opens: bail *)
+            | parseBody ((_, "mid", _) :: _) _ = NONE   (* >| / next_select: bail *)
+            | parseBody ((_, "expand", t) :: rest) acc =
+                parseBody rest (t :: acc)
+            | parseBody ((_, "expand_list", t) :: rest) acc =
+                parseBody rest (("(" ^ t ^ ")") :: acc)
+            | parseBody _ _ = NONE
+          (* Wrap final body for the >- arm of the SELECT_GOAL_LT.
+             Single-token body: no extra parens (matches old behaviour).
+             Multi-token body: parenthesise so >- binds the whole chain. *)
+          fun finishArm bodyText closeEnd rest' =
+                let
+                  (* Detect "single token" by absence of a top-level >> *)
+                  val needsParens = String.isSubstring " >> " bodyText
+                  val wrapped = if needsParens
+                                then "(" ^ bodyText ^ ")"
+                                else bodyText
+                in
+                  SOME (selectPrefix ^ " >- " ^ wrapped, closeEnd, rest')
+                end
           fun tryConsumeBracket [] = NONE
             | tryConsumeBracket ((_, "open", openName) :: rest') =
-                if isOpenArm openName then walkArm rest' [] 0 else NONE
+                if isOpenArm openName then
+                  (case parseBody rest' [] of
+                     NONE => NONE
+                   | SOME (bodyText, closeEnd, rest'') =>
+                       finishArm bodyText closeEnd rest'')
+                else NONE
             | tryConsumeBracket _ = NONE
         in
           case tryConsumeBracket afterSels of
