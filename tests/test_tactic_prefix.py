@@ -261,39 +261,60 @@ class TestThenLTReexpand:
         assert result[4].kind == "expand" and result[4].text == "fs[]"
 
     async def test_by_in_then_chain(self, hol_session):
-        """`by` inside >> chain decomposes: `Q` gets sg prefix, tactic base stays as-is."""
+        """`P` by tac inside >> chain merges into a SINGLE atomic step.
+
+        Why not decomposed: the naive [sg `P`, open_then1, tac, close_paren]
+        decomposition is INCORRECT under THEN-distribution over multiple
+        goals, because open_then1 only focuses the first global goal,
+        leaving N-1 sg-subgoals open. HOL4's actual `P` by tac is atomic
+        and distributes per-goal correctly. See test_by_distributes_over_*
+        below for the end-to-end regression."""
         result = await call_step_plan(hol_session, r"strip_tac >> `Q` by simp[] >> fs[]")
-        # strip_tac, sg `Q`, open_then1, simp[], close_paren, fs[]
-        assert len(result) == 6, f"Expected 6 steps, got {len(result)}: {[s.text for s in result]}"
+        # strip_tac, `Q` by simp[], fs[]
+        assert len(result) == 3, f"Expected 3 steps, got {len(result)}: {[s.text for s in result]}"
         assert result[0].kind == "expand" and result[0].text == "strip_tac"
-        assert result[1].kind == "expand" and result[1].text.startswith("sg")
-        assert result[2].kind == "open" and result[2].text == "open_then1"
-        assert result[3].kind == "expand" and "simp" in result[3].text
-        assert result[4].kind == "close" and result[4].text == "close_paren"
-        assert result[5].kind == "expand" and result[5].text == "fs[]"
+        assert result[1].kind == "expand" and result[1].text == "`Q` by simp[]"
+        assert result[2].kind == "expand" and result[2].text == "fs[]"
 
     async def test_by_tactic_base_no_sg_prefix(self, hol_session):
-        """`by` with tactic base (not term quotation) keeps base text unchanged."""
+        """`by` with tactic base (not term quotation) keeps base text unchanged.
+
+        Tactic-base `by` is not a Subgoal-from-term-quote pattern, so it does
+        not get the sg-prefix and does NOT trigger merge_by_steps. It keeps
+        the old decomposition (which is rare and benign in practice)."""
         result = await call_step_plan(hol_session, "strip_tac by simp[]")
         # strip_tac (not "sg strip_tac"), open_then1, simp[], close_paren
         assert len(result) == 4, f"Expected 4 steps, got {len(result)}: {[s.text for s in result]}"
         assert result[0].text == "strip_tac", f"Tactic base should not get sg: {result[0].text}"
 
-    async def test_sg_in_then_chain_decomposes(self, hol_session):
-        """`sg >-` inside >> chain decomposes."""
+    async def test_sg_in_then_chain_merges(self, hol_session):
+        """Explicit `sg `Q` >- tac` is semantically identical to ``Q` by tac`
+        and is merged the same way."""
         result = await call_step_plan(hol_session, r"strip_tac >> sg `Q` >- simp[] >> fs[]")
-        # strip_tac, sg `Q`, open_then1, simp[], close_paren, fs[]
-        assert len(result) == 6, f"Expected 6 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[1].kind == "expand" and "sg" in result[1].text.lower()
-        assert result[2].kind == "open"
+        # strip_tac, `Q` by simp[], fs[]
+        assert len(result) == 3, f"Expected 3 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[1].kind == "expand"
+        assert "by" in result[1].text and "`Q`" in result[1].text
 
-    async def test_by_term_base_gets_sg_prefix(self, hol_session):
-        """Standalone `by` with term quotation base gets sg prefix."""
+    async def test_by_term_base_merges(self, hol_session):
+        """Standalone `P` by tac (no enclosing chain) merges into one step."""
         result = await call_step_plan(hol_session, r"`Q` by simp[]")
-        # sg `Q`, open_then1, simp[], close_paren
-        assert len(result) == 4, f"Expected 4 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[0].text.startswith("sg"), f"Term base should get sg: {result[0].text}"
-        assert result[1].kind == "open"
+        # `Q` by simp[]
+        assert len(result) == 1, f"Expected 1 step, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand"
+        assert result[0].text == "`Q` by simp[]"
+
+    async def test_by_compound_body_merges(self, hol_session):
+        """`P` by (t1 >> t2): compound body merges with parens to keep
+        binding correct (so >- doesn't bind only to t1)."""
+        result = await call_step_plan(hol_session, r"`Q` by (simp[] >> fs[])")
+        assert len(result) == 1, f"Expected 1 step, got {len(result)}: {[s.text for s in result]}"
+        text = result[0].text
+        assert "`Q`" in text and "by" in text
+        # body grouped via parens
+        assert "(simp[] >> fs[])" in text or "(simp[]) >> (fs[])" in text or \
+               text.endswith("by (simp[] >> fs[])"), \
+            f"Compound body must be parenthesized after `by`: {text!r}"
 
     async def test_thenlt_bare_decomposes(self, hol_session):
         """Standalone >- (top level, not in >> chain) decomposes correctly."""
@@ -361,6 +382,132 @@ class TestThenLTReexpand:
         ends = [s.end for s in result]
         for i in range(1, len(ends)):
             assert ends[i] >= ends[i-1], f"End offsets not monotonic at step {i}: {ends}"
+
+
+# =============================================================================
+# Step Plan: `P` by tac in multi-goal contexts (regression for sg/>- decomp bug)
+#
+# REGRESSION: Previously the step plan decomposed ``P` by tac` into FOUR
+# separate ef() steps: [expand (sg P), open_then1, expand tac, close_paren].
+# When the by-pattern follows a multi-goal-producing tactic (Cases_on, conj_tac,
+# IF_CASES_TAC, etc.) under THEN-distribution (\\ / >>), the decomposition is
+# semantically WRONG:
+#
+#   - `expand (sg P)` distributes per-goal  →  N goals become 2N ([P_i; cont_i])
+#   - `open_then1` focuses ONLY the first global goal           ← bug
+#   - `expand tac` closes only that one P_1
+#   - `close_paren` leaves [cont_1, P_2, cont_2, ..., P_N, cont_N]
+#
+# The N-1 sg-subgoals P_2..P_N are NEVER discharged, so subsequent tactics
+# that operate on the cont_i shape leave the P_i open and the proof appears
+# INCOMPLETE in the MCP — even though Holmake (which runs ``P` by tac` as
+# one atomic per-goal tactic) closes the same proof cleanly.
+#
+# Fix: merge_by_steps in tactic_prefix.sml combines [Subgoal `P`, open_then1,
+# expand+, close_paren] back into a single expand step with the original
+# ``P` by tac` source text. Run via goalFrag.expand, distributes per-goal.
+# =============================================================================
+
+
+class TestByDistribution:
+    """``P` by tac` distribution under THEN over multi-goal stacks."""
+
+    async def test_step_plan_merges_by_after_multi_goal_split(self, hol_session):
+        """The full pattern `Cases_on q \\\\ \\`P\\` by tac \\\\ rest` in step plan
+        keeps the by-pattern as ONE atomic expand (not 4 decomposed steps)."""
+        result = await call_step_plan(
+            hol_session, r"Cases_on `q` >> `P` by tac >> rest"
+        )
+        # Cases_on `q`, `P` by tac, rest
+        kinds = [s.kind for s in result]
+        texts = [s.text for s in result]
+        assert kinds == ["expand", "expand", "expand"], (
+            f"Expected 3 atomic expand steps; got {list(zip(kinds, texts))}"
+        )
+        assert "by" in texts[1] and "`P`" in texts[1], (
+            f"Step 2 should be the merged `P` by tac form; got {texts[1]!r}"
+        )
+        # No bare sg/open_then1/close_paren plumbing should leak through.
+        for s in result:
+            assert s.text not in ("open_then1", "close_paren"), (
+                f"Decomposition plumbing leaked into step plan: {s.text}"
+            )
+            assert not s.text.startswith("sg `"), (
+                f"Raw sg-prefix Subgoal atom should have been merged: {s.text!r}"
+            )
+
+    async def test_by_proof_passes_after_multi_goal_split(self, hol_session):
+        """End-to-end: a proof that uses `P` by tac after a 2-goal split must
+        verify_theorem_json to "all goals closed".
+
+        Without merge_by_steps this exact proof would leave 1 sg-subgoal
+        (`1+1 = 2`) open after the final ACCEPT_TAC TRUTH (which can close
+        T but not 1+1=2). Reflects the data_to_word_assignProofScript.sml
+        cake-while idiom that exposed the bug:
+            Cases_on `q` >> `P` by tac >> closing_tac
+        """
+        await hol_session.send('drop_all();', timeout=5)
+        # Goal: T /\ T  (after conj_tac, 2 identical T goals)
+        cmd = (
+            'verify_theorem_json "T /\\\\ T" "by_multigoal_thm" '
+            '["ef(goalFrag.expand(conj_tac))",'
+            ' "ef(goalFrag.expand(`1+1 = 2` by EVAL_TAC))",'
+            ' "ef(goalFrag.expand(ACCEPT_TAC TRUTH))"] false 10.0;'
+        )
+        result = await hol_session.send(cmd, timeout=30)
+        ok_line = next(
+            (line.strip() for line in result.strip().split('\n')
+             if line.strip().startswith('{"ok":')),
+            None,
+        )
+        assert ok_line is not None, (
+            f"verify_theorem_json did not emit ok JSON. Output: {result!r}"
+        )
+        payload = json.loads(ok_line)['ok']
+        trace = payload.get('trace', [])
+        assert trace, f"Empty trace: {payload!r}"
+        last = trace[-1]
+        assert last.get('goals_after') == 0, (
+            f"Multi-goal `P` by tac left goals open: {trace!r}"
+        )
+
+    async def test_old_decomposition_would_have_failed(self, hol_session):
+        """Negative control: the OLD decomposed sequence
+        [conj_tac, sg `1+1=2`, open_then1, EVAL_TAC, close_paren, ACCEPT_TAC TRUTH]
+        leaves 1 unproven sg-subgoal — confirming that the merge in
+        merge_by_steps is what makes the prior test pass.
+
+        Demonstrates that the decomposition is semantically wrong, not just
+        cosmetically split."""
+        await hol_session.send('drop_all();', timeout=5)
+        cmd = (
+            'verify_theorem_json "T /\\\\ T" "by_multigoal_thm_old" '
+            '["ef(goalFrag.expand(conj_tac))",'
+            ' "ef(goalFrag.expand(sg `1+1 = 2`))",'
+            ' "ef(goalFrag.open_then1)",'
+            ' "ef(goalFrag.expand(EVAL_TAC))",'
+            ' "ef(goalFrag.close_paren)",'
+            ' "ef(goalFrag.expand(ACCEPT_TAC TRUTH))"] false 10.0;'
+        )
+        result = await hol_session.send(cmd, timeout=30)
+        ok_line = next(
+            (line.strip() for line in result.strip().split('\n')
+             if line.strip().startswith('{"ok":')),
+            None,
+        )
+        assert ok_line is not None, (
+            f"verify_theorem_json did not emit ok JSON. Output: {result!r}"
+        )
+        payload = json.loads(ok_line)['ok']
+        trace = payload.get('trace', [])
+        assert trace, f"Empty trace: {payload!r}"
+        last = trace[-1]
+        # The OLD decomposition strands the second `1+1 = 2` sg-subgoal —
+        # confirms why merging is needed.
+        assert last.get('goals_after', 0) > 0 or last.get('err') is not None, (
+            f"Decomposed sequence should have failed/left goals open, "
+            f"but trace says proof closed: {trace!r}"
+        )
 
 
 # =============================================================================
