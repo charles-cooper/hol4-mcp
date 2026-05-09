@@ -307,12 +307,89 @@ fun merge_select_steps [] acc = rev acc
       else
         merge_select_steps rest ((endP, kind, patText) :: acc)
 
+(* merge_by_steps: Post-process step list to merge a Subgoal atom (`P`) and
+   its following >- bracket back into a single atomic `P` by tac step.
+
+   WHY: `P` by tac is parsed by HOL4 as a single tactic equivalent to
+   `subgoal P >- tac`. When applied via THEN-distribution (\\ / >>) over a
+   multi-goal stack, HOL4 runs this tactic atomically per goal: each goal
+   independently gets P proven (by tac) and added as a hypothesis. Per goal:
+   1 in, 1 out.
+
+   The naive decomposition `expand (sg P), open_then1, expand tac, close_paren`
+   does NOT match this semantics. `expand (sg P)` distributes per-goal
+   (correctly producing 2N goals: [P_1, cont_1, ..., P_N, cont_N]), but
+   `open_then1` is a goalstate-level fragment tactic that always focuses on
+   the FIRST top-level goal. So only P_1 gets discharged; P_2..P_N remain
+   open as subgoals. Subsequent tactics applied via THEN do not generally
+   close those — they were meant to operate on the cont_i, not on the P_i.
+
+   This is exactly the bug that occurs when proofs use the common idiom
+
+       Cases_on `q` \\ ... \\ `tttt = ttt` by tac \\ fs[option_le_max]
+
+   after a multi-goal split. In real HOL4 (Holmake), the proof passes; in
+   the MCP's decomposed replay, N-1 sg-subgoals remain unproven and the
+   theorem looks INCOMPLETE.
+
+   Fix: detect the [Subgoal `P`, open_then1, expand+, close_paren] sequence
+   and merge it into a single atomic step `P by tac` (or `P by (t1 >> t2)`
+   for a compound body). The merged step is run via goalFrag.expand and
+   distributes correctly per-goal — matching Holmake.
+
+   Bails (no merge) on nested open/mid inside the body — those would need
+   full source reconstruction to preserve. The unmerged case keeps the old
+   behaviour, which is correct in single-goal contexts (top-level `P` by tac
+   without an upstream multi-goal-producing tactic in the same THEN chain). *)
+fun isSubgoalText t =
+      String.size t >= 4 andalso
+      String.substring (t, 0, 3) = "sg " andalso
+      String.sub (t, 3) = #"`"
+
+fun stripSgPrefix t = String.substring (t, 3, String.size t - 3)
+
+fun merge_by_steps [] acc = rev acc
+  | merge_by_steps ((endP, "expand", subgoalText) :: rest) acc =
+      if isSubgoalText subgoalText then
+        let
+          val patText = stripSgPrefix subgoalText
+          (* Walk a single >- arm: expand+, close. Bail on nested opens. *)
+          fun walkArm [] _ _ = NONE
+            | walkArm ((closeEnd, "close", _) :: rest') texts _ =
+                (case rev texts of
+                   [] => NONE
+                 | [single] => SOME (patText ^ " by " ^ single, closeEnd, rest')
+                 | many => SOME (patText ^ " by (" ^
+                                 String.concatWith " >> " many ^ ")",
+                                 closeEnd, rest'))
+            | walkArm ((endP', "expand", t) :: rest') texts _ =
+                walkArm rest' (t :: texts) endP'
+            | walkArm _ _ _ = NONE
+          fun tryConsume ((_, "open", "open_then1") :: rest') =
+                walkArm rest' [] 0
+            | tryConsume _ = NONE
+        in
+          case tryConsume rest of
+            SOME (combinedText, closeEnd, rest') =>
+              merge_by_steps rest' ((closeEnd, "expand", combinedText) :: acc)
+          | NONE =>
+              merge_by_steps rest ((endP, "expand", subgoalText) :: acc)
+        end
+      else
+        merge_by_steps rest ((endP, "expand", subgoalText) :: acc)
+  | merge_by_steps (step :: rest) acc =
+      merge_by_steps rest (step :: acc)
+
 (* goalfrag_step_plan: Generate fragment steps from linearize fragments.
    Returns (end_offset, type, text) triples for every navigable position.
    Every fragment boundary is a step boundary -- no heuristics needed.
    LSelectGoal/LSelectGroups fragments are merged with their following
    bracket into a single expand_list step (SELECT_GOAL_LT requires
-   goalFrag.expand_list, not goalFrag.expand). *)
+   goalFrag.expand_list, not goalFrag.expand).
+   Subgoal atoms (`P`) are merged with their following >- arm into a single
+   atomic `P` by tac step (preserves HOL4's per-goal distribution semantics
+   when the by-pattern is in a THEN-distributed chain after a multi-goal-
+   producing tactic — see merge_by_steps). *)
 fun goalfrag_step_plan proofBody =
   let
     val tree = parseTacticBlockFromString proofBody
@@ -342,8 +419,9 @@ fun goalfrag_step_plan proofBody =
             else assignEnds rest lastAtomEnd acc
           end
     val rawSteps = assignEnds reexpanded 0 []
+    val afterSelect = merge_select_steps rawSteps []
   in
-    merge_select_steps rawSteps []
+    merge_by_steps afterSelect []
   end
 
 fun goalfrag_step_plan_json proofBody =
